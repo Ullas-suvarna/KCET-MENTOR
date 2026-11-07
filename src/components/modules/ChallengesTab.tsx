@@ -528,15 +528,19 @@ export const ChallengesTab: React.FC = () => {
             {/* Question Set Cards */}
             {isQuestionSetsOpen && (
               <div className="space-y-3 pt-1">
-                {questionSets.map((set) => (
+                {questionSets.map((set, idx) => {
+                  const setName = set.name || ('KCET PCM Challenge Set ' + String(idx + 1).padStart(2, '0'));
+                  const setQuestions = set.questionCount ?? 20;
+                  const setSubjects = set.subjects || 'Physics • Chemistry • Math PCM';
+                  return (
                   <div
                     key={set.id}
                     className="bg-[#2A2E45] rounded-2xl p-4 border border-slate-700/60 flex items-center justify-between gap-3 flex-wrap"
                   >
                     <div className="space-y-0.5">
-                      <h4 className="text-sm font-black text-white">{set.name}</h4>
+                      <h4 className="text-sm font-black text-white">{setName}</h4>
                       <p className="text-xs text-slate-400 font-medium">
-                        {set.questionCount} Questions ({set.subjects})
+                        {setQuestions} Questions ({setSubjects})
                       </p>
                     </div>
 
@@ -563,7 +567,8 @@ export const ChallengesTab: React.FC = () => {
                       </button>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             )}
 

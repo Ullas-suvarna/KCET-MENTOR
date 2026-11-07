@@ -535,9 +535,40 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
         unsubs.push(onSnapshot(collection(db, 'challenge_question_sets'), (snap) => {
           if (!snap.empty) {
-            const list: ChallengeQuestionSet[] = [];
-            snap.forEach(d => list.push({ id: d.id, ...d.data() } as ChallengeQuestionSet));
-            setQuestionSets(list);
+            const remoteMap = new Map<string, any>();
+            snap.forEach(d => remoteMap.set(d.id, d.data()));
+
+            // Merge with INITIAL_QUESTION_SETS so default 5 sets always have complete metadata
+            const merged: ChallengeQuestionSet[] = INITIAL_QUESTION_SETS.map((init, idx) => {
+              const remote = remoteMap.get(init.id);
+              if (!remote) return init;
+              return {
+                ...init,
+                ...remote,
+                name: remote.name || init.name || ('KCET PCM Challenge Set ' + String(idx + 1).padStart(2, '0')),
+                questionCount: remote.questionCount !== undefined ? Number(remote.questionCount) : init.questionCount,
+                subjects: remote.subjects || init.subjects,
+                isActive: remote.isActive !== undefined ? Boolean(remote.isActive) : init.isActive
+              };
+            });
+
+            // Add any custom sets created dynamically
+            remoteMap.forEach((data, id) => {
+              if (!INITIAL_QUESTION_SETS.some(s => s.id === id)) {
+                merged.push({
+                  id,
+                  name: data.name || ('KCET PCM Challenge Set ' + id),
+                  questionCount: data.questionCount !== undefined ? Number(data.questionCount) : 20,
+                  subjects: data.subjects || 'Physics • Chemistry • Math PCM',
+                  isActive: data.isActive !== undefined ? Boolean(data.isActive) : true,
+                  ...data
+                });
+              }
+            });
+
+            setQuestionSets(merged);
+          } else {
+            setQuestionSets(INITIAL_QUESTION_SETS);
           }
         }, () => {}));
       } catch (e) {
@@ -1827,11 +1858,20 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const toggleQuestionSet = async (id: string, active: boolean) => {
     setQuestionSets(prev => prev.map(s => s.id === id ? { ...s, isActive: active } : s));
 
+    const setItem = questionSets.find(s => s.id === id) || INITIAL_QUESTION_SETS.find(s => s.id === id);
+    const payload = {
+      id,
+      name: setItem?.name || ('KCET PCM Challenge Set ' + id.replace('set-', '')),
+      questionCount: setItem?.questionCount || 20,
+      subjects: setItem?.subjects || 'Physics • Chemistry • Math PCM',
+      isActive: active
+    };
+
     const tasks: Promise<any>[] = [
-      setDoc(doc(db, 'challenge_question_sets', id), { isActive: active }, { merge: true })
+      setDoc(doc(db, 'challenge_question_sets', id), payload, { merge: true })
     ];
     try {
-      tasks.push(rtdbSet(ref(rtdb, 'challenge_question_sets/' + id + '/isActive'), active));
+      tasks.push(rtdbSet(ref(rtdb, 'challenge_question_sets/' + id), payload));
     } catch (e) {}
 
     await Promise.all(tasks).catch(e => console.warn('Toggle question set error:', e));

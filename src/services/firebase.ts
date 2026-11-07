@@ -9,6 +9,7 @@ import {
   deleteDoc, 
   onSnapshot, 
   query, 
+  where,
   Firestore,
   writeBatch
 } from 'firebase/firestore';
@@ -72,6 +73,7 @@ export {
   deleteDoc,
   onSnapshot,
   query,
+  where,
   writeBatch,
   signInWithEmailAndPassword,
   signOut,

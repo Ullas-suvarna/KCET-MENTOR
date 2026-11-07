@@ -75,7 +75,7 @@ interface AdminDataContextType {
   saveTestSeries: (ts: TestSeriesSet) => Promise<void>;
   deleteTestSeries: (id: string) => Promise<void>;
   saveMentor: (m: Mentor) => Promise<void>;
-  deleteMentor: (id: string) => Promise<void>;
+  deleteMentor: (id: string, mentorName?: string) => Promise<void>;
   updateBooking: (b: SeniorChatBooking) => Promise<void>;
   saveBooking: (b: SeniorChatBooking) => Promise<void>;
   deleteBooking: (id: string) => Promise<void>;
@@ -222,6 +222,9 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   // mergeAndEmit applies these so the UI never flickers back to stale data
   // while onSnapshot is still propagating the Firestore write.
   const pendingStudentOverrides = useRef<Map<string, Partial<User>>>(new Map());
+  // Tracks deleted mentor IDs and names to guarantee immediate UI updates without race condition flicker
+  const deletedMentorIds = useRef<Set<string>>(new Set());
+  const deletedMentorNames = useRef<Set<string>>(new Set());
 
   // Real-time Firestore snapshot synchronization
   useEffect(() => {
@@ -244,22 +247,176 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           setTestSeries(list);
         }
       }, () => {}));
-      // 3. Mentors
+      // 3. Mentors — Dual-Database Synchronization (Firestore + Realtime Database 'registeredMentors')
+      let fsMentorsList: Mentor[] = [];
+      let rtdbMentorsList: Mentor[] = [];
+      let regMentorsFsList: Mentor[] = [];
+      let seniorMentorsFsList: Mentor[] = [];
+
+      const syncMentorsMultiSource = () => {
+        const combined = [...rtdbMentorsList, ...fsMentorsList, ...regMentorsFsList, ...seniorMentorsFsList];
+        const map = new Map<string, Mentor>();
+
+        for (const m of combined) {
+          if (!m || !m.name) continue;
+          const cleanName = m.name.trim();
+          const normName = cleanName.toLowerCase();
+          const mentorId = m.id || normName;
+
+          // If deleted locally by admin, ignore from incoming snapshots
+          if (deletedMentorIds.current.has(mentorId) || deletedMentorNames.current.has(normName)) {
+            continue;
+          }
+
+          // Dedup by normalized name or ID
+          let matchedKey = '';
+          for (const [k, existing] of map.entries()) {
+            if (k === normName || existing.id === mentorId || existing.name.toLowerCase() === normName) {
+              matchedKey = k;
+              break;
+            }
+          }
+
+          if (matchedKey) {
+            const existing = map.get(matchedKey)!;
+            map.set(matchedKey, {
+              id: existing.id || mentorId,
+              name: existing.name || cleanName,
+              branch: existing.branch || m.branch || '',
+              college: existing.college || m.college || '',
+              currentYear: existing.currentYear || m.currentYear || '',
+              kcetRank: existing.kcetRank || m.kcetRank || '',
+              rating: existing.rating || Number(m.rating) || 5.0,
+              bio: existing.bio || m.bio || '',
+              email: existing.email || m.email || '',
+              instagram: existing.instagram || m.instagram || '',
+              photoUrl: existing.photoUrl || m.photoUrl || ''
+            });
+          } else {
+            map.set(normName, {
+              id: mentorId,
+              name: cleanName,
+              branch: m.branch || '',
+              college: m.college || '',
+              currentYear: m.currentYear || '',
+              kcetRank: m.kcetRank || '',
+              rating: Number(m.rating) || 5.0,
+              bio: m.bio || '',
+              email: m.email || '',
+              instagram: m.instagram || '',
+              photoUrl: m.photoUrl || ''
+            });
+          }
+        }
+
+        const merged = Array.from(map.values());
+        if (merged.length > 0 || (fsMentorsList.length === 0 && rtdbMentorsList.length === 0)) {
+          setMentors(merged);
+        }
+      };
+
+      // 3A. Firestore Collection: 'mentors'
       unsubs.push(onSnapshot(collection(db, 'mentors'), (snap) => {
-        if (!snap.empty) {
-          const list: Mentor[] = [];
-          snap.forEach(d => list.push({ id: d.id, ...d.data() } as Mentor));
-          setMentors(list);
-        }
+        fsMentorsList = snap.docs.map(d => ({ id: d.id, ...d.data() } as Mentor));
+        syncMentorsMultiSource();
+      }, (err) => console.warn('Firestore mentors listener notice:', err)));
+
+      // 3B. Firestore Collection: 'registered_mentors'
+      unsubs.push(onSnapshot(collection(db, 'registered_mentors'), (snap) => {
+        regMentorsFsList = snap.docs.map(d => ({ id: d.id, ...d.data() } as Mentor));
+        syncMentorsMultiSource();
       }, () => {}));
-      // 4. Senior Chat Bookings
+
+      // 3C. Firestore Collection: 'senior_mentors'
+      unsubs.push(onSnapshot(collection(db, 'senior_mentors'), (snap) => {
+        seniorMentorsFsList = snap.docs.map(d => ({ id: d.id, ...d.data() } as Mentor));
+        syncMentorsMultiSource();
+      }, () => {}));
+
+      // 3D. Realtime Database (RTDB): 'registeredMentors' (Direct match to Android observeAllSeniorMentors)
+      try {
+        const mentorsRtdbRef = ref(rtdb, 'registeredMentors');
+        const unsubRtdbMentors = onValue(mentorsRtdbRef, (snap) => {
+          try {
+            const val = snap.val();
+            if (!val) {
+              rtdbMentorsList = [];
+            } else if (Array.isArray(val)) {
+              rtdbMentorsList = val.filter(Boolean).map((item, idx) => ({
+                id: item.id || ('rtdb-' + idx),
+                name: item.name || '',
+                branch: item.branch || '',
+                college: item.college || '',
+                currentYear: item.currentYear || '',
+                kcetRank: item.kcetRank || '',
+                rating: Number(item.rating) || 5.0,
+                bio: item.bio || '',
+                email: item.email || '',
+                instagram: item.instagram || '',
+                photoUrl: item.photoUrl || ''
+              }));
+            } else if (typeof val === 'object') {
+              rtdbMentorsList = Object.entries(val).map(([k, item]: [string, any]) => ({
+                id: item?.id || k,
+                name: item?.name || k.replace(/_/g, ' '),
+                branch: item?.branch || '',
+                college: item?.college || '',
+                currentYear: item?.currentYear || '',
+                kcetRank: item?.kcetRank || '',
+                rating: Number(item?.rating) || 5.0,
+                bio: item?.bio || '',
+                email: item?.email || '',
+                instagram: item?.instagram || '',
+                photoUrl: item?.photoUrl || ''
+              }));
+            }
+            syncMentorsMultiSource();
+          } catch (e) {
+            console.warn('RTDB registeredMentors parse notice:', e);
+          }
+        }, (err) => console.warn('RTDB registeredMentors listener notice:', err));
+        unsubs.push(() => unsubRtdbMentors());
+      } catch (e) {
+        console.warn('Could not attach RTDB /registeredMentors listener:', e);
+      }
+
+      // 4. Senior Chat Bookings (Firestore + Realtime Database)
       unsubs.push(onSnapshot(collection(db, 'senior_chat_bookings'), (snap) => {
-        if (!snap.empty) {
-          const list: SeniorChatBooking[] = [];
-          snap.forEach(d => list.push({ bookingId: d.id, ...d.data() } as SeniorChatBooking));
-          setBookings(list);
-        }
+        const list: SeniorChatBooking[] = [];
+        snap.forEach(d => list.push({ bookingId: d.id, ...d.data() } as SeniorChatBooking));
+        setBookings(list);
       }, () => {}));
+
+      try {
+        const bookingsRtdbRef = ref(rtdb, 'senior_chat_bookings');
+        const unsubRtdbBookings = onValue(bookingsRtdbRef, (snap) => {
+          try {
+            const val = snap.val();
+            if (val && typeof val === 'object') {
+              const rtdbList: SeniorChatBooking[] = Object.entries(val).map(([k, item]: [string, any]) => ({
+                bookingId: item?.bookingId || k,
+                ...(typeof item === 'object' ? item : {})
+              }));
+              setBookings(prev => {
+                if (prev.length === 0) return rtdbList;
+                const map = new Map<string, SeniorChatBooking>();
+                prev.forEach(b => map.set(b.bookingId, b));
+                rtdbList.forEach(b => {
+                  if (!map.has(b.bookingId)) {
+                    map.set(b.bookingId, b);
+                  }
+                });
+                return Array.from(map.values());
+              });
+            }
+          } catch (e) {
+            console.warn('RTDB senior_chat_bookings notice:', e);
+          }
+        }, () => {});
+        unsubs.push(() => unsubRtdbBookings());
+      } catch (e) {
+        console.warn('Could not attach RTDB /senior_chat_bookings listener:', e);
+      }
       // 5. Resources
       unsubs.push(onSnapshot(collection(db, 'resources'), (snap) => {
         if (!snap.empty) {
@@ -569,13 +726,26 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       for (const s of INITIAL_STUDENTS) {
         await setDoc(doc(db, 'users', s.uid), s);
       }
-      // Seed Mentors
+      // Seed Mentors (Dual-Database Sync: Firestore + RTDB registeredMentors)
       for (const m of INITIAL_MENTORS) {
+        const cleanKey = (m.name || '').replace(/[.#$\[\]\/@]/g, '_').trim();
         await setDoc(doc(db, 'mentors', m.id), m);
+        await setDoc(doc(db, 'registered_mentors', m.id), m);
+        await setDoc(doc(db, 'senior_mentors', m.id), m);
+        try {
+          await rtdbSet(ref(rtdb, 'registeredMentors/' + cleanKey), m);
+        } catch (e) {
+          // ignore RTDB seed warning
+        }
       }
-      // Seed Bookings
+      // Seed Bookings (Dual-Database Sync: Firestore + RTDB)
       for (const bk of INITIAL_BOOKINGS) {
         await setDoc(doc(db, 'senior_chat_bookings', bk.bookingId), bk);
+        try {
+          await rtdbSet(ref(rtdb, 'senior_chat_bookings/' + bk.bookingId), bk);
+        } catch (e) {
+          // ignore RTDB seed warning
+        }
       }
       // Seed Resources
       for (const r of INITIAL_RESOURCES) {
@@ -654,31 +824,125 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       console.warn('Deleted test set locally', e);
     }
   };
-  // 3. Mentors & Bookings
+  // 3. Mentors & Bookings (Dual-Database Sync: Firestore + Realtime Database)
+  const sanitizeKey = (k: string) => (k || '').replace(/[.#$\[\]\/@]/g, '_').trim();
+
   const saveMentor = async (m: Mentor) => {
+    const mentorId = m.id || ('m-' + Date.now());
+    const mentorName = m.name.trim();
+    const normName = mentorName.toLowerCase();
+    const cleanKey = sanitizeKey(mentorName);
+    const cleanId = sanitizeKey(mentorId);
+
+    // Remove from locally deleted sets if re-adding/updating
+    deletedMentorIds.current.delete(mentorId);
+    deletedMentorIds.current.delete(cleanId);
+    deletedMentorNames.current.delete(normName);
+    deletedMentorNames.current.delete(cleanKey);
+
+    const profile: Mentor & { updatedAtTimestamp: number } = {
+      id: mentorId,
+      name: mentorName,
+      branch: m.branch || '',
+      college: m.college || '',
+      currentYear: m.currentYear || '',
+      kcetRank: m.kcetRank || '',
+      rating: Number(m.rating) || 5.0,
+      bio: m.bio || '',
+      email: m.email || '',
+      instagram: m.instagram || '',
+      photoUrl: m.photoUrl || '',
+      updatedAtTimestamp: Date.now()
+    };
+
+    // 1. Optimistic UI update
     setMentors(prev => {
-      const idx = prev.findIndex(item => item.id === m.id);
+      const idx = prev.findIndex(item => item.id === mentorId || item.name.toLowerCase() === normName);
       if (idx >= 0) {
         const u = [...prev];
-        u[idx] = m;
+        u[idx] = profile;
         return u;
       }
-      return [m, ...prev];
+      return [profile, ...prev];
     });
+
+    // 2. Dual-Database Write (Concurrent Promise.all)
+    const tasks: Promise<any>[] = [];
+
+    // A. Realtime Database (Reactive UI Layer for Android App & Web)
     try {
-      await setDoc(doc(db, 'mentors', m.id), m);
-    } catch (e) {
-      console.warn('Saved mentor locally', e);
+      tasks.push(rtdbSet(ref(rtdb, 'registeredMentors/' + cleanKey), profile));
+      if (cleanId !== cleanKey) {
+        tasks.push(rtdbSet(ref(rtdb, 'registeredMentors/' + cleanId), profile));
+      }
+    } catch (err) {
+      console.warn('RTDB saveSeniorMentor error:', err);
     }
-  };
-  const deleteMentor = async (id: string) => {
-    setMentors(prev => prev.filter(m => m.id !== id));
+
+    // B. Firestore (Primary Data Store) across all 3 collections
     try {
-      await deleteDoc(doc(db, 'mentors', id));
-    } catch (e) {
-      console.warn('Deleted mentor locally', e);
+      tasks.push(setDoc(doc(db, 'mentors', mentorId), profile));
+      tasks.push(setDoc(doc(db, 'registered_mentors', mentorId), profile));
+      tasks.push(setDoc(doc(db, 'senior_mentors', mentorId), profile));
+      if (cleanKey !== mentorId) {
+        tasks.push(setDoc(doc(db, 'mentors', cleanKey), profile));
+      }
+    } catch (err) {
+      console.warn('Firestore saveSeniorMentor error:', err);
     }
+
+    await Promise.all(tasks).catch(e => console.warn('Dual-sync saveMentor notice:', e));
   };
+
+  const deleteMentor = async (id: string, mentorNameParam?: string) => {
+    // 1. Resolve exact mentor name and ID
+    const target = mentors.find(m => m.id === id || m.name === id || (mentorNameParam && m.name === mentorNameParam));
+    const mentorName = (mentorNameParam || target?.name || id).trim();
+    const normName = mentorName.toLowerCase();
+    const cleanKey = sanitizeKey(mentorName);
+    const cleanId = sanitizeKey(id);
+
+    // 2. Mark as locally deleted (Guarantees instant UI response without bounce-back)
+    deletedMentorIds.current.add(id);
+    deletedMentorIds.current.add(cleanId);
+    deletedMentorNames.current.add(normName);
+    deletedMentorNames.current.add(cleanKey);
+
+    setMentors(prev => prev.filter(m => m.id !== id && m.name.toLowerCase() !== normName && m.id !== cleanKey));
+
+    const tasks: Promise<any>[] = [];
+
+    // 3. Delete from Realtime Database (registeredMentors node — triggers Android app UI update instantly)
+    try {
+      tasks.push(rtdbSet(ref(rtdb, 'registeredMentors/' + cleanKey), null));
+      tasks.push(rtdbSet(ref(rtdb, 'registeredMentors/' + cleanId), null));
+      tasks.push(rtdbSet(ref(rtdb, 'globally_deleted_mentors/' + cleanKey), Date.now()));
+    } catch (err) {
+      console.warn('RTDB deleteSeniorMentor error:', err);
+    }
+
+    // 4. Delete from Cloud Firestore across all 3 collections (Permanent storage)
+    try {
+      tasks.push(deleteDoc(doc(db, 'mentors', id)));
+      tasks.push(deleteDoc(doc(db, 'registered_mentors', id)));
+      tasks.push(deleteDoc(doc(db, 'senior_mentors', id)));
+      if (cleanKey !== id) {
+        tasks.push(deleteDoc(doc(db, 'mentors', cleanKey)));
+        tasks.push(deleteDoc(doc(db, 'registered_mentors', cleanKey)));
+        tasks.push(deleteDoc(doc(db, 'senior_mentors', cleanKey)));
+      }
+      tasks.push(setDoc(doc(db, 'deleted_mentors', cleanKey), {
+        id,
+        name: mentorName,
+        deletedAtMillis: Date.now()
+      }));
+    } catch (err) {
+      console.warn('Firestore deleteSeniorMentor error:', err);
+    }
+
+    await Promise.all(tasks).catch(e => console.warn('Dual-sync deleteMentor notice:', e));
+  };
+
   const updateBooking = async (b: SeniorChatBooking) => {
     setBookings(prev => {
       const idx = prev.findIndex(item => item.bookingId === b.bookingId);
@@ -689,20 +953,32 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
       return [b, ...prev];
     });
+
+    const tasks: Promise<any>[] = [
+      setDoc(doc(db, 'senior_chat_bookings', b.bookingId), b)
+    ];
     try {
-      await setDoc(doc(db, 'senior_chat_bookings', b.bookingId), b);
+      tasks.push(rtdbSet(ref(rtdb, 'senior_chat_bookings/' + b.bookingId), b));
     } catch (e) {
-      console.warn('Updated booking locally', e);
+      // RTDB fallback
     }
+    await Promise.all(tasks).catch(e => console.warn('Dual-sync updateBooking notice:', e));
   };
+
   const saveBooking = updateBooking;
+
   const deleteBooking = async (id: string) => {
     setBookings(prev => prev.filter(b => b.bookingId !== id));
+
+    const tasks: Promise<any>[] = [
+      deleteDoc(doc(db, 'senior_chat_bookings', id))
+    ];
     try {
-      await deleteDoc(doc(db, 'senior_chat_bookings', id));
+      tasks.push(rtdbSet(ref(rtdb, 'senior_chat_bookings/' + id), null));
     } catch (e) {
-      console.warn('Deleted booking locally', e);
+      // RTDB fallback
     }
+    await Promise.all(tasks).catch(e => console.warn('Dual-sync deleteBooking notice:', e));
   };
   // 4. Resources
   const saveResource = async (r: Resource, notifyStudents = false) => {

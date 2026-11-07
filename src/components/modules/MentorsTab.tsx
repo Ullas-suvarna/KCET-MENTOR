@@ -2544,7 +2544,7 @@ export const MentorsTab: React.FC = () => {
 
 
 
-                          await deleteMentor(mentor.id);
+                          await deleteMentor(mentor.id, mentor.name);
 
 
 

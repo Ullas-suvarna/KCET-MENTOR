@@ -232,7 +232,7 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   });
   const [branches, setBranches] = useState<EngineeringBranch[]>(INITIAL_BRANCHES);
   // ⚔️ 1 vs 1 Challenges State
-  const [challenges, setChallenges] = useState<OneVsOneChallenge[]>(INITIAL_CHALLENGES);
+  const [challenges, setChallenges] = useState<OneVsOneChallenge[]>([]);
   const [questionSets, setQuestionSets] = useState<ChallengeQuestionSet[]>(INITIAL_QUESTION_SETS);
   const [challengeSettings, setChallengeSettings] = useState<ChallengeSettings>(INITIAL_CHALLENGE_SETTINGS);
   const [deletedStudents, setDeletedStudents] = useState<DeletedStudent[]>([]);
@@ -476,40 +476,44 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       }, () => {}));
 
-      // 10. ⚔️ 1 vs 1 Challenges (Realtime Firestore onSnapshot + Realtime Database)
+      // 10. ⚔️ 1 vs 1 Challenges (Realtime Firestore onSnapshot + Realtime Database - Zero Fake Data)
       unsubs.push(onSnapshot(collection(db, 'one_vs_one_challenges'), (snap) => {
-        if (!snap.empty) {
-          const list: OneVsOneChallenge[] = [];
-          snap.forEach(d => {
-            const data = d.data();
-            list.push({
-              challengeId: d.id,
-              user1Id: data.user1Id || '',
-              user2Id: data.user2Id || '',
-              user1Name: data.user1Name || data.user1Id || 'Student 1',
-              user2Name: data.user2Name || data.user2Id || 'Student 2',
-              user1Avatar: data.user1Avatar,
-              user2Avatar: data.user2Avatar,
-              subject: data.subject || 'Physics • Chemistry • Math PCM',
-              status: data.status || 'WAITING',
-              type: data.type || (data.wagerXp ? 'XP_WAGER' : 'FRIENDLY'),
-              wagerXp: data.wagerXp,
-              timerString: data.timerString || '00:00:00',
-              timerSeconds: data.timerSeconds || 0,
-              scoreUser1: Number(data.scoreUser1) || 0,
-              scoreUser2: Number(data.scoreUser2) || 0,
-              winnerId: data.winnerId,
-              winnerName: data.winnerName,
-              timestamp: data.timestamp || Date.now(),
-              createdAtFormatted: data.createdAtFormatted || 'Recently',
-              notes: data.notes
-            } as OneVsOneChallenge);
-          });
-          setChallenges(list);
-        }
+        const list: OneVsOneChallenge[] = [];
+        snap.forEach(d => {
+          const data = d.data();
+          const tMillis = typeof data.timestamp === 'number' ? data.timestamp : (data.timestamp?.toMillis ? data.timestamp.toMillis() : Date.now());
+          list.push({
+            challengeId: d.id,
+            user1Id: data.user1Id || '',
+            user2Id: data.user2Id || '',
+            user1Name: data.user1Name || data.user1Id || 'Student 1',
+            user2Name: data.user2Name || data.user2Id || 'Student 2',
+            user1Avatar: data.user1Avatar,
+            user2Avatar: data.user2Avatar,
+            subject: data.subject || 'PHYSICS',
+            status: (data.status || 'WAITING').toUpperCase(),
+            type: data.type || (data.wagerXp ? 'XP_WAGER' : 'FRIENDLY'),
+            wagerXp: data.wagerXp,
+            timerString: data.timerString || '00:00:00',
+            timerSeconds: data.timerSeconds || 0,
+            scoreUser1: Number(data.scoreUser1) || 0,
+            scoreUser2: Number(data.scoreUser2) || 0,
+            winnerId: data.winnerId,
+            winnerName: data.winnerName,
+            timestamp: tMillis,
+            createdAtFormatted: data.createdAtFormatted || new Date(tMillis).toLocaleString('en-IN', {
+              day: '2-digit', month: 'short', year: 'numeric',
+              hour: '2-digit', minute: '2-digit', hour12: true
+            }),
+            notes: data.notes
+          } as OneVsOneChallenge);
+        });
+        // Sort descending by timestamp (most recent first)
+        list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+        setChallenges(list);
       }, (err) => console.warn('Firestore one_vs_one_challenges listener notice:', err)));
 
-      // Realtime Database listener for chatConfig/price & challengeConfig/timer
+      // Realtime Database listener for chatConfig/price, chatConfig/challengeSettings & challengeConfig/timer
       try {
         const priceRef = ref(rtdb, 'chatConfig/price');
         const unsubPrice = onValue(priceRef, (snap) => {
@@ -519,6 +523,24 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           }
         }, () => {});
         unsubs.push(() => unsubPrice());
+
+        // Unified Android Reactive Config Path: chatConfig/challengeSettings
+        const challengeSettingsRef = ref(rtdb, 'chatConfig/challengeSettings');
+        const unsubChallengeSettings = onValue(challengeSettingsRef, (snap) => {
+          const val = snap.val();
+          if (val && typeof val === 'object') {
+            setChallengeSettings(prev => ({
+              ...prev,
+              liveChallengeEntryFee: val.price !== undefined ? Number(val.price) : prev.liveChallengeEntryFee,
+              durationSeconds: val.durationSeconds !== undefined ? Number(val.durationSeconds) : prev.durationSeconds,
+              physicsEnabled: val.enabledSubjects?.PHYSICS !== undefined ? val.enabledSubjects.PHYSICS : prev.physicsEnabled,
+              chemistryEnabled: val.enabledSubjects?.CHEMISTRY !== undefined ? val.enabledSubjects.CHEMISTRY : prev.chemistryEnabled,
+              mathEnabled: val.enabledSubjects?.MATH !== undefined ? val.enabledSubjects.MATH : prev.mathEnabled,
+              pcmEnabled: val.enabledSubjects?.PCM !== undefined ? val.enabledSubjects.PCM : prev.pcmEnabled,
+            }));
+          }
+        }, () => {});
+        unsubs.push(() => unsubChallengeSettings());
 
         const timerRef = ref(rtdb, 'challengeConfig/timer');
         const unsubTimer = onValue(timerRef, (snap) => {
@@ -1886,8 +1908,19 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       ];
       try {
         if (settings.liveChallengeEntryFee !== undefined) {
-          tasks.push(rtdbSet(ref(rtdb, 'chatConfig/price'), settings.liveChallengeEntryFee));
+          tasks.push(rtdbSet(ref(rtdb, 'chatConfig/price'), Number(settings.liveChallengeEntryFee)));
         }
+        // Unified Android RTDB sync: chatConfig/challengeSettings
+        tasks.push(rtdbSet(ref(rtdb, 'chatConfig/challengeSettings'), {
+          price: Number(next.liveChallengeEntryFee) || 50,
+          durationSeconds: Number(next.durationSeconds) || 120,
+          enabledSubjects: {
+            PHYSICS: Boolean(next.physicsEnabled),
+            CHEMISTRY: Boolean(next.chemistryEnabled),
+            MATH: Boolean(next.mathEnabled),
+            PCM: Boolean(next.pcmEnabled)
+          }
+        }));
         if (settings.durationHours !== undefined || settings.durationMinutes !== undefined) {
           tasks.push(rtdbSet(ref(rtdb, 'challengeConfig/timer'), {
             hours: next.durationHours,

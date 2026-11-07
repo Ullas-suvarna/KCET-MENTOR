@@ -109,36 +109,27 @@ export const ChallengesTab: React.FC = () => {
   // ─────────────────────────────────────────────────────────────
   // Top Winners Aggregated Leaderboard
   // ─────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────
+  // Top Winners Aggregated Leaderboard (Group by winnerId in COMPLETED docs)
+  // ─────────────────────────────────────────────────────────────
   const topWinners = useMemo(() => {
-    const stats = new Map<string, { name: string; wins: number; totalBattles: number; xpWon: number }>();
+    const stats = new Map<string, { id: string; name: string; wins: number; totalBattles: number; xpWon: number }>();
 
     challenges.forEach(c => {
-      // Record user 1
-      if (c.user1Name) {
-        const u1 = stats.get(c.user1Name) || { name: c.user1Name, wins: 0, totalBattles: 0, xpWon: 0 };
-        u1.totalBattles += 1;
-        if (c.winnerName === c.user1Name) {
-          u1.wins += 1;
-          u1.xpWon += c.wagerXp || 50;
-        }
-        stats.set(c.user1Name, u1);
-      }
-      // Record user 2
-      if (c.user2Name) {
-        const u2 = stats.get(c.user2Name) || { name: c.user2Name, wins: 0, totalBattles: 0, xpWon: 0 };
-        u2.totalBattles += 1;
-        if (c.winnerName === c.user2Name) {
-          u2.wins += 1;
-          u2.xpWon += c.wagerXp || 50;
-        }
-        stats.set(c.user2Name, u2);
+      if (c.status === 'COMPLETED' && (c.winnerId || c.winnerName)) {
+        const key = c.winnerId || c.winnerName || 'unknown';
+        const name = c.winnerName || c.winnerId || 'Student';
+        const entry = stats.get(key) || { id: key, name, wins: 0, totalBattles: 0, xpWon: 0 };
+        entry.wins += 1;
+        entry.totalBattles += 1;
+        entry.xpWon += c.wagerXp || 50;
+        stats.set(key, entry);
       }
     });
 
     return Array.from(stats.values())
-      .filter(w => w.wins > 0)
       .sort((a, b) => b.wins - a.wins || b.xpWon - a.xpWon)
-      .slice(0, 8);
+      .slice(0, 10);
   }, [challenges]);
 
   // ─────────────────────────────────────────────────────────────
@@ -191,7 +182,7 @@ export const ChallengesTab: React.FC = () => {
         return (
           <span className="px-2.5 py-1 rounded-md text-[11px] font-black tracking-wide bg-emerald-500 text-white shadow-sm flex items-center gap-1 animate-pulse">
             <span className="w-1.5 h-1.5 rounded-full bg-white"></span>
-            RUNNING
+            ACTIVE
           </span>
         );
       case 'COMPLETED':
@@ -202,22 +193,22 @@ export const ChallengesTab: React.FC = () => {
         );
       case 'EXPIRED':
         return (
-          <span className="px-2.5 py-1 rounded-md text-[11px] font-black tracking-wide bg-[#334155] text-slate-300">
+          <span className="px-2.5 py-1 rounded-md text-[11px] font-black tracking-wide bg-rose-900/80 text-rose-200 border border-rose-800">
             EXPIRED
           </span>
         );
       case 'TERMINATED':
       case 'ABANDONED':
         return (
-          <span className="px-2.5 py-1 rounded-md text-[11px] font-black tracking-wide bg-[#1E293B] text-slate-300 border border-slate-600">
-            TERMINATED
+          <span className="px-2.5 py-1 rounded-md text-[11px] font-black tracking-wide bg-rose-600 text-white shadow-sm">
+            ABANDONED
           </span>
         );
       case 'PENDING':
       case 'WAITING':
         return (
           <span className="px-2.5 py-1 rounded-md text-[11px] font-black tracking-wide bg-amber-500 text-white shadow-sm">
-            PENDING
+            WAITING
           </span>
         );
       case 'PAUSED':

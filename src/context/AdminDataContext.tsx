@@ -17,7 +17,10 @@ import {
   BranchCutoff,
   EngineeringBranch,
   DeletedStudent,
-  BookingStatus
+  BookingStatus,
+  OneVsOneChallenge,
+  ChallengeQuestionSet,
+  ChallengeSettings
 } from '../types';
 import {
   INITIAL_QUESTIONS,
@@ -35,7 +38,10 @@ import {
   INITIAL_RECEIPTS,
   INITIAL_COLLEGES,
   INITIAL_BRANCH_CUTOFFS,
-  INITIAL_BRANCHES
+  INITIAL_BRANCHES,
+  INITIAL_CHALLENGES,
+  INITIAL_QUESTION_SETS,
+  INITIAL_CHALLENGE_SETTINGS
 } from '../services/mockData';
 import { ToastContainer, ToastItem, ToastType } from '../components/common/Toast';
 import { ConfirmModal, ConfirmDialogState } from '../components/common/ConfirmModal';
@@ -116,6 +122,14 @@ interface AdminDataContextType {
   deleteCutoff: (id: string) => Promise<void>;
   saveBranch: (b: EngineeringBranch) => Promise<void>;
   deleteBranch: (id: string) => Promise<void>;
+  // ⚔️ 1 vs 1 Challenges
+  challenges: OneVsOneChallenge[];
+  questionSets: ChallengeQuestionSet[];
+  challengeSettings: ChallengeSettings;
+  saveChallenge: (challenge: OneVsOneChallenge) => Promise<void>;
+  deleteChallenge: (id: string) => Promise<void>;
+  toggleQuestionSet: (id: string, active: boolean) => Promise<void>;
+  updateChallengeSettings: (settings: Partial<ChallengeSettings>) => Promise<void>;
 }
 const AdminDataContext = createContext<AdminDataContextType | undefined>(undefined);
 export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -217,6 +231,10 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return INITIAL_BRANCH_CUTOFFS;
   });
   const [branches, setBranches] = useState<EngineeringBranch[]>(INITIAL_BRANCHES);
+  // ⚔️ 1 vs 1 Challenges State
+  const [challenges, setChallenges] = useState<OneVsOneChallenge[]>(INITIAL_CHALLENGES);
+  const [questionSets, setQuestionSets] = useState<ChallengeQuestionSet[]>(INITIAL_QUESTION_SETS);
+  const [challengeSettings, setChallengeSettings] = useState<ChallengeSettings>(INITIAL_CHALLENGE_SETTINGS);
   const [deletedStudents, setDeletedStudents] = useState<DeletedStudent[]>([]);
   // Pending admin overrides — keyed by student uid.
   // mergeAndEmit applies these so the UI never flickers back to stale data
@@ -457,6 +475,74 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           setNotifications(list);
         }
       }, () => {}));
+
+      // 10. ⚔️ 1 vs 1 Challenges (Realtime Firestore onSnapshot + Realtime Database)
+      unsubs.push(onSnapshot(collection(db, 'one_vs_one_challenges'), (snap) => {
+        if (!snap.empty) {
+          const list: OneVsOneChallenge[] = [];
+          snap.forEach(d => {
+            const data = d.data();
+            list.push({
+              challengeId: d.id,
+              user1Id: data.user1Id || '',
+              user2Id: data.user2Id || '',
+              user1Name: data.user1Name || data.user1Id || 'Student 1',
+              user2Name: data.user2Name || data.user2Id || 'Student 2',
+              user1Avatar: data.user1Avatar,
+              user2Avatar: data.user2Avatar,
+              subject: data.subject || 'Physics • Chemistry • Math PCM',
+              status: data.status || 'WAITING',
+              type: data.type || (data.wagerXp ? 'XP_WAGER' : 'FRIENDLY'),
+              wagerXp: data.wagerXp,
+              timerString: data.timerString || '00:00:00',
+              timerSeconds: data.timerSeconds || 0,
+              scoreUser1: Number(data.scoreUser1) || 0,
+              scoreUser2: Number(data.scoreUser2) || 0,
+              winnerId: data.winnerId,
+              winnerName: data.winnerName,
+              timestamp: data.timestamp || Date.now(),
+              createdAtFormatted: data.createdAtFormatted || 'Recently',
+              notes: data.notes
+            } as OneVsOneChallenge);
+          });
+          setChallenges(list);
+        }
+      }, (err) => console.warn('Firestore one_vs_one_challenges listener notice:', err)));
+
+      // Realtime Database listener for chatConfig/price & challengeConfig/timer
+      try {
+        const priceRef = ref(rtdb, 'chatConfig/price');
+        const unsubPrice = onValue(priceRef, (snap) => {
+          const p = snap.val();
+          if (p !== null && p !== undefined) {
+            setChallengeSettings(prev => ({ ...prev, liveChallengeEntryFee: Number(p) || prev.liveChallengeEntryFee }));
+          }
+        }, () => {});
+        unsubs.push(() => unsubPrice());
+
+        const timerRef = ref(rtdb, 'challengeConfig/timer');
+        const unsubTimer = onValue(timerRef, (snap) => {
+          const t = snap.val();
+          if (t && typeof t === 'object') {
+            setChallengeSettings(prev => ({
+              ...prev,
+              durationHours: t.hours !== undefined ? Number(t.hours) : prev.durationHours,
+              durationMinutes: t.minutes !== undefined ? Number(t.minutes) : prev.durationMinutes
+            }));
+          }
+        }, () => {});
+        unsubs.push(() => unsubTimer());
+
+        unsubs.push(onSnapshot(collection(db, 'challenge_question_sets'), (snap) => {
+          if (!snap.empty) {
+            const list: ChallengeQuestionSet[] = [];
+            snap.forEach(d => list.push({ id: d.id, ...d.data() } as ChallengeQuestionSet));
+            setQuestionSets(list);
+          }
+        }, () => {}));
+      } catch (e) {
+        console.warn('Challenge listeners notice:', e);
+      }
       // 10. Users / Students — Multi-source merge with full deduplication
       // Combines /users + /user_accounts + /user_profiles (shared Android schema) through the
       // 5-way clustering algorithm and filters /deleted_students in real time.
@@ -766,6 +852,17 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       // Seed Rank Tiers
       for (const rt of INITIAL_RANK_VS_MARKS) {
         await setDoc(doc(db, 'rank_vs_marks', rt.id), rt);
+      }
+      // Seed 1v1 Challenges (Dual-Database Sync: Firestore + RTDB)
+      for (const ch of INITIAL_CHALLENGES) {
+        await setDoc(doc(db, 'one_vs_one_challenges', ch.challengeId), ch);
+        try {
+          await rtdbSet(ref(rtdb, 'one_vs_one_challenges/' + ch.challengeId), ch);
+        } catch (e) {}
+      }
+      // Seed Question Sets
+      for (const qs of INITIAL_QUESTION_SETS) {
+        await setDoc(doc(db, 'challenge_question_sets', qs.id), qs);
       }
       setSyncStatus('All collections seeded to Firestore!');
     } catch (e: any) {
@@ -1684,6 +1781,85 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       console.warn('Deleted branch locally', e);
     }
   };
+
+  // ⚔️ 1 vs 1 Challenges Operations (Dual-Database Sync: Firestore + Realtime Database)
+  const saveChallenge = async (challenge: OneVsOneChallenge) => {
+    setChallenges(prev => {
+      const idx = prev.findIndex(item => item.challengeId === challenge.challengeId);
+      if (idx >= 0) {
+        const u = [...prev];
+        u[idx] = challenge;
+        return u;
+      }
+      return [challenge, ...prev];
+    });
+
+    const tasks: Promise<any>[] = [
+      setDoc(doc(db, 'one_vs_one_challenges', challenge.challengeId), challenge)
+    ];
+    try {
+      tasks.push(rtdbSet(ref(rtdb, 'one_vs_one_challenges/' + challenge.challengeId), challenge));
+    } catch (e) {}
+
+    await Promise.all(tasks).catch(e => console.warn('Dual-sync saveChallenge error:', e));
+  };
+
+  const deleteChallenge = async (id: string) => {
+    setChallenges(prev => prev.filter(c => c.challengeId !== id));
+
+    // Two-step atomic deletion (Firestore + Realtime Database)
+    const tasks: Promise<any>[] = [
+      deleteDoc(doc(db, 'one_vs_one_challenges', id)),
+      setDoc(doc(db, 'deleted_challenges', id), {
+        challengeId: id,
+        deletedAtMillis: Date.now()
+      })
+    ];
+    try {
+      tasks.push(rtdbSet(ref(rtdb, 'one_vs_one_challenges/' + id), null));
+      tasks.push(rtdbSet(ref(rtdb, 'active_challenges/' + id), null));
+    } catch (e) {}
+
+    await Promise.all(tasks).catch(e => console.warn('Dual-sync deleteChallenge error:', e));
+    notifySuccess('Challenge permanently deleted and synced with App.', 'Challenge Deleted');
+  };
+
+  const toggleQuestionSet = async (id: string, active: boolean) => {
+    setQuestionSets(prev => prev.map(s => s.id === id ? { ...s, isActive: active } : s));
+
+    const tasks: Promise<any>[] = [
+      setDoc(doc(db, 'challenge_question_sets', id), { isActive: active }, { merge: true })
+    ];
+    try {
+      tasks.push(rtdbSet(ref(rtdb, 'challenge_question_sets/' + id + '/isActive'), active));
+    } catch (e) {}
+
+    await Promise.all(tasks).catch(e => console.warn('Toggle question set error:', e));
+    notifySuccess('Question set ' + (active ? 'activated' : 'deactivated') + ' and synced with App.', 'Set Updated');
+  };
+
+  const updateChallengeSettings = async (settings: Partial<ChallengeSettings>) => {
+    setChallengeSettings(prev => {
+      const next = { ...prev, ...settings };
+      const tasks: Promise<any>[] = [
+        setDoc(doc(db, 'challenge_settings', 'global'), next, { merge: true })
+      ];
+      try {
+        if (settings.liveChallengeEntryFee !== undefined) {
+          tasks.push(rtdbSet(ref(rtdb, 'chatConfig/price'), settings.liveChallengeEntryFee));
+        }
+        if (settings.durationHours !== undefined || settings.durationMinutes !== undefined) {
+          tasks.push(rtdbSet(ref(rtdb, 'challengeConfig/timer'), {
+            hours: next.durationHours,
+            minutes: next.durationMinutes
+          }));
+        }
+      } catch (e) {}
+      Promise.all(tasks).catch(e => console.warn('Update challenge settings error:', e));
+      return next;
+    });
+    notifySuccess('Challenge settings updated and broadcasted to all students.', 'Settings Synced');
+  };
   return (
     <AdminDataContext.Provider
       value={{
@@ -1755,7 +1931,14 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         notifyWarning,
         dismissToast,
         requestConfirm,
-        deleteBranch
+        deleteBranch,
+        challenges,
+        questionSets,
+        challengeSettings,
+        saveChallenge,
+        deleteChallenge,
+        toggleQuestionSet,
+        updateChallengeSettings
       }}
     >
       {children}

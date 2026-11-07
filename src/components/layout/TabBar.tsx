@@ -30,7 +30,8 @@ export const TabBar: React.FC<TabBarProps> = ({ activeTab, onSelectTab }) => {
     helplines,
     receipts,
     colleges,
-    branches
+    branches,
+    challenges
   } = useAdminData();
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -104,6 +105,11 @@ export const TabBar: React.FC<TabBarProps> = ({ activeTab, onSelectTab }) => {
       id: 'branches', 
       name: '🔬 Branch Explorer', 
       badge: branches.length 
+    },
+    { 
+      id: 'challenges', 
+      name: '⚔️ 1v1 Challenges', 
+      badge: challenges.length 
     },
     {
       id: 'student-view',

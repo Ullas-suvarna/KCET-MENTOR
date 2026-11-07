@@ -1040,4 +1040,65 @@ export const DEMANDED_BRANCHES = [
 
 export const STANDARD_BRANCHES = DEMANDED_BRANCHES;
 
+// ==========================================
+// ⚔️ 1 VS 1 CHALLENGE CONTROL CENTER TYPES
+// ==========================================
+export type ChallengeStatus = 
+  | 'WAITING' 
+  | 'PENDING' 
+  | 'IN_PROGRESS' 
+  | 'RUNNING' 
+  | 'COMPLETED' 
+  | 'ABANDONED' 
+  | 'TERMINATED' 
+  | 'EXPIRED' 
+  | 'PAUSED';
+
+export type ChallengeType = 'FRIENDLY' | 'XP_WAGER';
+
+export interface OneVsOneChallenge {
+  challengeId: string;
+  user1Id: string;
+  user2Id: string;
+  user1Name: string;
+  user2Name: string;
+  user1Avatar?: string;
+  user2Avatar?: string;
+  subject: string;
+  status: ChallengeStatus;
+  type: ChallengeType;
+  wagerXp?: number;
+  timerString?: string;
+  timerSeconds?: number;
+  scoreUser1: number;
+  scoreUser2: number;
+  winnerId?: string;
+  winnerName?: string;
+  timestamp?: number | any;
+  createdAtFormatted?: string;
+  notes?: string;
+}
+
+export interface ChallengeQuestionSet {
+  id: string;
+  name: string;
+  questionCount: number;
+  subjects: string;
+  isActive: boolean;
+}
+
+export interface ChallengeSettings {
+  liveChallengeEntryFee: number;
+  physicsEnabled: boolean;
+  chemistryEnabled: boolean;
+  mathEnabled: boolean;
+  pcmEnabled: boolean;
+  durationSeconds: number;
+  durationHours: number;
+  durationMinutes: number;
+  autoExpireMinutes: number;
+  maxWagerXp: number;
+}
+
+
 

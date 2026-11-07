@@ -27,6 +27,7 @@ import { ReceiptsTab } from './modules/ReceiptsTab';
 import { CollegesTab } from './modules/CollegesTab';
 
 import { BranchExplorerTab } from './modules/BranchExplorerTab';
+import { ChallengesTab } from './modules/ChallengesTab';
 
 import { StudentBranchExplorer } from './student/StudentBranchExplorer';
 
@@ -139,6 +140,7 @@ export const Dashboard: React.FC = () => {
         {activeTab === 'colleges' && <CollegesTab />}
 
         {activeTab === 'branches' && <BranchExplorerTab />}
+        {activeTab === 'challenges' && <ChallengesTab />}
 
         {activeTab === 'student-view' && (
 

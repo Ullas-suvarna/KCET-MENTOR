@@ -71,12 +71,12 @@ export const ChallengesTab: React.FC = () => {
   // Computed Metrics (Matches Screenshot 1 exact counts!)
   // ─────────────────────────────────────────────────────────────
   const totalCount = challenges.length;
-  const pendingCount = challenges.filter(c => c.status === 'PENDING' || c.status === 'WAITING').length;
-  const runningCount = challenges.filter(c => c.status === 'RUNNING' || c.status === 'IN_PROGRESS').length;
-  const completedCount = challenges.filter(c => c.status === 'COMPLETED').length;
+  const pendingCount = challenges.filter(c => c.status === 'PENDING' || c.status === 'WAITING' || c.status === 'PREPARING').length;
+  const runningCount = challenges.filter(c => c.status === 'RUNNING' || c.status === 'IN_PROGRESS' || c.status === 'PREPARING').length;
+  const completedCount = challenges.filter(c => c.status === 'COMPLETED' || c.status === 'DRAW').length;
   const expiredTermCount = challenges.filter(c => c.status === 'EXPIRED' || c.status === 'TERMINATED' || c.status === 'ABANDONED').length;
-  const xpWagersCount = challenges.filter(c => c.type === 'XP_WAGER' || (c.wagerXp && c.wagerXp > 0)).length;
-  const friendlyCount = challenges.filter(c => c.type === 'FRIENDLY' || !c.wagerXp).length;
+  const xpWagersCount = challenges.filter(c => c.type === 'XP_WAGER' || c.type === 'XP' || (c.wagerXp && c.wagerXp > 0) || (c.entryXP && c.entryXP > 0)).length;
+  const friendlyCount = challenges.filter(c => c.type === 'FRIENDLY' || (!c.wagerXp && !c.entryXP)).length;
 
   // ─────────────────────────────────────────────────────────────
   // Filtered Challenges List
@@ -84,13 +84,13 @@ export const ChallengesTab: React.FC = () => {
   const filteredChallenges = useMemo(() => {
     return challenges.filter(c => {
       // 1. Status Filter
-      if (statusFilter === 'PENDING' && !(c.status === 'PENDING' || c.status === 'WAITING')) return false;
-      if (statusFilter === 'RUNNING' && !(c.status === 'RUNNING' || c.status === 'IN_PROGRESS')) return false;
-      if (statusFilter === 'PAUSED' && c.status !== 'PAUSED') return false;
-      if (statusFilter === 'COMPLETED' && c.status !== 'COMPLETED') return false;
+      if (statusFilter === 'PENDING' && !(c.status === 'PENDING' || c.status === 'WAITING' || c.status === 'PREPARING')) return false;
+      if (statusFilter === 'RUNNING' && !(c.status === 'RUNNING' || c.status === 'IN_PROGRESS' || c.status === 'PREPARING')) return false;
+      if (statusFilter === 'PAUSED' && c.status !== 'PAUSED' && !c.paused) return false;
+      if (statusFilter === 'COMPLETED' && !(c.status === 'COMPLETED' || c.status === 'DRAW')) return false;
       if (statusFilter === 'EXPIRED_TERM' && !(c.status === 'EXPIRED' || c.status === 'TERMINATED' || c.status === 'ABANDONED')) return false;
-      if (statusFilter === 'XP_WAGER' && !(c.type === 'XP_WAGER' || (c.wagerXp && c.wagerXp > 0))) return false;
-      if (statusFilter === 'FRIENDLY' && !(c.type === 'FRIENDLY' || !c.wagerXp)) return false;
+      if (statusFilter === 'XP_WAGER' && !(c.type === 'XP_WAGER' || c.type === 'XP' || (c.wagerXp && c.wagerXp > 0) || (c.entryXP && c.entryXP > 0))) return false;
+      if (statusFilter === 'FRIENDLY' && !(c.type === 'FRIENDLY' || (!c.wagerXp && !c.entryXP))) return false;
 
       // 2. Search Query (Matches names or challenge ID)
       if (searchQuery.trim()) {
@@ -177,6 +177,13 @@ export const ChallengesTab: React.FC = () => {
 
   const getStatusBadge = (status: ChallengeStatus) => {
     switch (status) {
+      case 'PREPARING':
+        return (
+          <span className="px-2.5 py-1 rounded-md text-[11px] font-black tracking-wide bg-amber-500 text-white shadow-sm flex items-center gap-1 animate-pulse">
+            <span className="w-1.5 h-1.5 rounded-full bg-white"></span>
+            PREPARING
+          </span>
+        );
       case 'RUNNING':
       case 'IN_PROGRESS':
         return (
@@ -189,6 +196,12 @@ export const ChallengesTab: React.FC = () => {
         return (
           <span className="px-2.5 py-1 rounded-md text-[11px] font-black tracking-wide bg-[#4338CA] text-indigo-100 shadow-sm">
             COMPLETED
+          </span>
+        );
+      case 'DRAW':
+        return (
+          <span className="px-2.5 py-1 rounded-md text-[11px] font-black tracking-wide bg-purple-600 text-white shadow-sm">
+            DRAW
           </span>
         );
       case 'EXPIRED':

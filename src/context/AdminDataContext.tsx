@@ -476,41 +476,106 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       }, () => {}));
 
-      // 10. ⚔️ 1 vs 1 Challenges (Realtime Firestore onSnapshot + Realtime Database - Zero Fake Data)
-      unsubs.push(onSnapshot(collection(db, 'one_vs_one_challenges'), (snap) => {
-        const list: OneVsOneChallenge[] = [];
-        snap.forEach(d => {
-          const data = d.data();
-          const tMillis = typeof data.timestamp === 'number' ? data.timestamp : (data.timestamp?.toMillis ? data.timestamp.toMillis() : Date.now());
-          list.push({
-            challengeId: d.id,
-            user1Id: data.user1Id || '',
-            user2Id: data.user2Id || '',
-            user1Name: data.user1Name || data.user1Id || 'Student 1',
-            user2Name: data.user2Name || data.user2Id || 'Student 2',
-            user1Avatar: data.user1Avatar,
-            user2Avatar: data.user2Avatar,
-            subject: data.subject || 'PHYSICS',
-            status: (data.status || 'WAITING').toUpperCase(),
-            type: data.type || (data.wagerXp ? 'XP_WAGER' : 'FRIENDLY'),
-            wagerXp: data.wagerXp,
-            timerString: data.timerString || '00:00:00',
-            timerSeconds: data.timerSeconds || 0,
-            scoreUser1: Number(data.scoreUser1) || 0,
-            scoreUser2: Number(data.scoreUser2) || 0,
-            winnerId: data.winnerId,
-            winnerName: data.winnerName,
-            timestamp: tMillis,
-            createdAtFormatted: data.createdAtFormatted || new Date(tMillis).toLocaleString('en-IN', {
-              day: '2-digit', month: 'short', year: 'numeric',
-              hour: '2-digit', minute: '2-digit', hour12: true
-            }),
-            notes: data.notes
-          } as OneVsOneChallenge);
+      // 10. ⚔️ 1 vs 1 Challenges (Realtime Firestore onSnapshot on 'challenges' - 100% Real Android App Parity)
+      const parseChallengeDoc = (d: any): OneVsOneChallenge => {
+        const data = d.data();
+        const id = d.id;
+        const cAt = typeof data.createdAt === 'number' 
+          ? data.createdAt 
+          : (data.createdAt?.toMillis ? data.createdAt.toMillis() : (typeof data.timestamp === 'number' ? data.timestamp : (data.timestamp?.toMillis ? data.timestamp.toMillis() : Date.now())));
+
+        const user1Id = data.challengerId || data.user1Id || '';
+        const user2Id = data.challengedId || data.user2Id || '';
+        const user1Name = data.challengerName || data.user1Name || data.challengerId || 'Student 1';
+        const user2Name = data.challengedName || data.user2Name || data.challengedId || 'Student 2';
+        const user1Avatar = data.challengerPhoto || data.user1Avatar;
+        const user2Avatar = data.challengedPhoto || data.user2Avatar;
+
+        const rawStatus = (data.status || 'WAITING').toUpperCase();
+        
+        const scoreUser1 = data.challengerScore !== null && data.challengerScore !== undefined 
+          ? Number(data.challengerScore) 
+          : (data.scoreUser1 !== undefined ? Number(data.scoreUser1) : 0);
+        const scoreUser2 = data.challengedScore !== null && data.challengedScore !== undefined 
+          ? Number(data.challengedScore) 
+          : (data.scoreUser2 !== undefined ? Number(data.scoreUser2) : 0);
+
+        const isXp = data.challengeType === 'XP' || data.xpChallenge === true || (data.entryXP && data.entryXP > 0) || data.type === 'XP_WAGER';
+        const wagerXp = data.entryXP || data.wagerXp || (isXp ? 200 : 0);
+
+        const winnerId = data.winnerId || null;
+        let winnerName = data.winnerName;
+        if (!winnerName && winnerId) {
+          if (winnerId === user1Id) winnerName = user1Name;
+          else if (winnerId === user2Id) winnerName = user2Name;
+        }
+
+        const timerString = data.timerString || '00:00:00';
+
+        const createdAtFormatted = data.createdAtFormatted || new Date(cAt).toLocaleString('en-IN', {
+          day: '2-digit', month: 'short', year: 'numeric',
+          hour: '2-digit', minute: '2-digit', hour12: true
         });
-        // Sort descending by timestamp (most recent first)
+
+        const subjectStr = data.subject || (data.questionSetId ? ('PCM Set ' + String(data.questionSetId).replace('set_', '').toUpperCase()) : 'Physics • Chemistry • Math PCM');
+
+        return {
+          challengeId: id,
+          user1Id,
+          user2Id,
+          user1Name,
+          user2Name,
+          user1Avatar,
+          user2Avatar,
+          subject: subjectStr,
+          status: rawStatus as any,
+          type: (isXp ? 'XP_WAGER' : 'FRIENDLY') as any,
+          wagerXp,
+          entryXP: data.entryXP,
+          prizeXP: data.prizeXP,
+          timerString,
+          timerSeconds: data.timerSeconds || 0,
+          scoreUser1,
+          scoreUser2,
+          winnerId,
+          winnerName,
+          loserId: data.loserId,
+          timestamp: cAt,
+          createdAt: cAt,
+          createdAtFormatted,
+          questionSetId: data.questionSetId,
+          questionIds: data.questionIds,
+          paused: Boolean(data.paused),
+          draw: Boolean(data.draw),
+          terminationReason: data.terminationReason,
+          notes: data.notes
+        };
+      };
+
+      let realAndroidChallenges: OneVsOneChallenge[] = [];
+      let legacyChallenges: OneVsOneChallenge[] = [];
+
+      const syncAllChallenges = () => {
+        const map = new Map<string, OneVsOneChallenge>();
+        legacyChallenges.forEach(c => map.set(c.challengeId, c));
+        // Real Android 'challenges' collection is authoritative
+        realAndroidChallenges.forEach(c => map.set(c.challengeId, c));
+
+        const list = Array.from(map.values());
         list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
         setChallenges(list);
+      };
+
+      // Listen directly to Android's primary 'challenges' collection in real-time!
+      unsubs.push(onSnapshot(collection(db, 'challenges'), (snap) => {
+        realAndroidChallenges = snap.docs.map(d => parseChallengeDoc(d));
+        syncAllChallenges();
+      }, (err) => console.warn('Firestore challenges listener notice:', err)));
+
+      // Listen also to 'one_vs_one_challenges' if any doc exists
+      unsubs.push(onSnapshot(collection(db, 'one_vs_one_challenges'), (snap) => {
+        legacyChallenges = snap.docs.map(d => parseChallengeDoc(d));
+        syncAllChallenges();
       }, (err) => console.warn('Firestore one_vs_one_challenges listener notice:', err)));
 
       // Realtime Database listener for chatConfig/price, chatConfig/challengeSettings & challengeConfig/timer
@@ -1860,8 +1925,9 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const deleteChallenge = async (id: string) => {
     setChallenges(prev => prev.filter(c => c.challengeId !== id));
 
-    // Two-step atomic deletion (Firestore + Realtime Database)
+    // Two-step atomic deletion (Firestore 'challenges' + 'one_vs_one_challenges' + Realtime Database)
     const tasks: Promise<any>[] = [
+      deleteDoc(doc(db, 'challenges', id)),
       deleteDoc(doc(db, 'one_vs_one_challenges', id)),
       setDoc(doc(db, 'deleted_challenges', id), {
         challengeId: id,
@@ -1869,6 +1935,7 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       })
     ];
     try {
+      tasks.push(rtdbSet(ref(rtdb, 'challenges/' + id), null));
       tasks.push(rtdbSet(ref(rtdb, 'one_vs_one_challenges/' + id), null));
       tasks.push(rtdbSet(ref(rtdb, 'active_challenges/' + id), null));
     } catch (e) {}

@@ -1046,15 +1046,18 @@ export const STANDARD_BRANCHES = DEMANDED_BRANCHES;
 export type ChallengeStatus = 
   | 'WAITING' 
   | 'PENDING' 
+  | 'PREPARING'
   | 'IN_PROGRESS' 
   | 'RUNNING' 
   | 'COMPLETED' 
+  | 'DRAW'
   | 'ABANDONED' 
   | 'TERMINATED' 
   | 'EXPIRED' 
-  | 'PAUSED';
+  | 'PAUSED'
+  | string;
 
-export type ChallengeType = 'FRIENDLY' | 'XP_WAGER';
+export type ChallengeType = 'FRIENDLY' | 'XP_WAGER' | 'XP' | string;
 
 export interface OneVsOneChallenge {
   challengeId: string;
@@ -1068,14 +1071,23 @@ export interface OneVsOneChallenge {
   status: ChallengeStatus;
   type: ChallengeType;
   wagerXp?: number;
+  entryXP?: number;
+  prizeXP?: number;
   timerString?: string;
   timerSeconds?: number;
   scoreUser1: number;
   scoreUser2: number;
-  winnerId?: string;
-  winnerName?: string;
+  winnerId?: string | null;
+  winnerName?: string | null;
+  loserId?: string | null;
   timestamp?: number | any;
+  createdAt?: number;
   createdAtFormatted?: string;
+  questionSetId?: string;
+  questionIds?: number[];
+  paused?: boolean;
+  draw?: boolean;
+  terminationReason?: string | null;
   notes?: string;
 }
 

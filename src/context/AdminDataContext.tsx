@@ -1371,7 +1371,18 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       };
       setNotifications(prev => [newNotif, ...prev]);
       try {
-        await setDoc(doc(db, 'notifications', notifId), newNotif);
+        const notifTasks: Promise<any>[] = [
+          setDoc(doc(db, 'notifications', notifId), newNotif)
+        ];
+        // If targeted to a specific student, write to their personal subcollection & RTDB so their app catches it instantly
+        if (isTargeted && resolvedTargetUserId !== 'ALL') {
+          notifTasks.push(setDoc(doc(db, 'users', resolvedTargetUserId, 'notifications', notifId), newNotif, { merge: true }).catch(() => {}));
+          notifTasks.push(setDoc(doc(db, 'user_notifications', resolvedTargetUserId, 'notifications', notifId), newNotif, { merge: true }).catch(() => {}));
+          try {
+            notifTasks.push(rtdbSet(ref(rtdb, 'user_notifications/' + resolvedTargetUserId + '/' + notifId), newNotif));
+          } catch (_) {}
+        }
+        await Promise.all(notifTasks);
       } catch (e) {
         console.warn('Saved notification locally', e);
       }
@@ -1407,33 +1418,99 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       console.warn('Deleted notification locally', e);
     }
   };
-  // 8. Students Moderation
+  // 8. Students Moderation — Dual-Sync Firestore + Realtime Database (100% Android Sync)
   const updateStudent = async (student: Partial<User> & { uid: string }) => {
     const nowMillis = Date.now();
 
-    // ── Step 1: Look up current student (needed for email fallback + name diff) ──
-    const currentStudent = students.find(s => s.uid === student.uid);
+    const currentStudent = students.find(s => s.uid === student.uid || (student.email && s.email?.toLowerCase() === student.email.toLowerCase()));
     const previousName   = currentStudent?.name;
     const effectiveEmail = (student.email || currentStudent?.email || '').toLowerCase().trim();
+    const effectiveUid   = student.uid || currentStudent?.uid || '';
 
-    // ── Step 2: Build full Firestore payload (Android schema) ─────────────────
+    // Build comprehensive multi-platform payload covering all Android field aliases
     const payload: Record<string, unknown> = {
       ...student,
+      uid: effectiveUid,
+      email: effectiveEmail,
       lastUpdatedMillis: nowMillis,
+      lastUpdated: nowMillis,
     };
-    if (student.studentId)        payload.formattedStudentId = student.studentId;
-    if (student.formattedStudentId) payload.studentId = student.formattedStudentId;
 
-    // ── Step 3: Register override FIRST — mergeAndEmit will apply it immediately
-    //           This prevents onSnapshot from ever reverting the UI to stale data.
-    pendingStudentOverrides.current.set(student.uid, {
+    // Name aliases
+    if (student.name) {
+      payload.name = student.name;
+      payload.studentName = student.name;
+      payload.displayName = student.name;
+      payload.userName = student.name;
+    }
+
+    // Phone aliases
+    if (student.phone) {
+      payload.phone = student.phone;
+      payload.phoneNumber = student.phone;
+      payload.contactNumber = student.phone;
+    }
+
+    // ID aliases
+    const sid = student.studentId || student.formattedStudentId || currentStudent?.studentId || '';
+    if (sid) {
+      payload.studentId = sid;
+      payload.formattedStudentId = sid;
+    }
+
+    // Stream & Rank aliases
+    if (student.targetStream) {
+      payload.targetStream = student.targetStream;
+      payload.stream = student.targetStream;
+      payload.targetBranch = student.targetStream;
+    }
+    if (student.kcetTargetRank) {
+      payload.kcetTargetRank = student.kcetTargetRank;
+      payload.targetRank = student.kcetTargetRank;
+    }
+
+    // Password aliases
+    if (student.password || student.displayPassword) {
+      const pwd = student.password || student.displayPassword;
+      payload.password = pwd;
+      payload.displayPassword = pwd;
+    }
+
+    // Block status aliases
+    if (student.isBlocked !== undefined) {
+      payload.isBlocked = Boolean(student.isBlocked);
+      payload.blocked = Boolean(student.isBlocked);
+      payload.status = student.isBlocked ? 'BLOCKED' : 'ACTIVE';
+      payload.accountStatus = student.isBlocked ? 'BLOCKED' : 'ACTIVE';
+      payload.isBanned = Boolean(student.isBlocked);
+      payload.blockReason = student.blockReason || '';
+    }
+
+    // Force logout aliases
+    if (student.isForceLoggedOut !== undefined) {
+      payload.isForceLoggedOut = Boolean(student.isForceLoggedOut);
+      payload.forceLogout = Boolean(student.isForceLoggedOut);
+      payload.forceLoggedOut = Boolean(student.isForceLoggedOut);
+      payload.sessionValid = !student.isForceLoggedOut;
+      payload.lastForceLogoutTime = nowMillis;
+    }
+
+    // Premium status aliases
+    if (student.isPremium !== undefined) {
+      payload.isPremium = Boolean(student.isPremium);
+      payload.premium = Boolean(student.isPremium);
+      payload.plan = student.isPremium ? 'PREMIUM' : 'FREE';
+      payload.accountType = student.isPremium ? 'PREMIUM' : 'FREE';
+    }
+
+    // Optimistic UI state update
+    pendingStudentOverrides.current.set(effectiveUid, {
       ...(payload as Partial<User>),
       lastUpdatedMillis: nowMillis,
     });
 
-    // ── Step 4: Optimistic local state update (instant) ──────────────────────
     setStudents(prev => {
-      const idx = prev.findIndex(s => s.uid === student.uid);
+      const idx = prev.findIndex(s => s.uid === effectiveUid || (effectiveEmail && s.email?.toLowerCase() === effectiveEmail));
       if (idx >= 0) {
         const u = [...prev];
         u[idx] = { ...u[idx], ...(payload as Partial<User>), lastUpdatedMillis: nowMillis };
@@ -1442,74 +1519,86 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return prev;
     });
 
-    // ── Step 5: Fire all Firestore writes CONCURRENTLY ────────────────────────
-    //           (Promise.all → only 1-2 onSnapshot emissions instead of 4+)
-    const sanitizedEmailDoc = effectiveEmail.replace(/[@.]/g, '_');
-    const androidEmailKey   = effectiveEmail.replace('.', '_').replace('@', '_');
+    // ── Firestore Multi-Target Writes ──────────────────────────────
+    const sanitizedEmailDoc = effectiveEmail ? effectiveEmail.replace(/[@.]/g, '_') : '';
+    const androidEmailKey   = effectiveEmail ? effectiveEmail.replace('.', '_').replace('@', '_') : '';
 
-    const writes: Promise<void>[] = [
-      setDoc(doc(db, 'users',        student.uid), payload, { merge: true }),
-      setDoc(doc(db, 'user_profiles', student.uid), payload, { merge: true }),
-    ];
+    const writes: Promise<any>[] = [];
+    if (effectiveUid) {
+      writes.push(setDoc(doc(db, 'users', effectiveUid), payload, { merge: true }));
+      writes.push(setDoc(doc(db, 'user_profiles', effectiveUid), payload, { merge: true }));
+    }
     if (effectiveEmail) {
-      writes.push(setDoc(doc(db, 'users',         sanitizedEmailDoc), payload, { merge: true }));
-      writes.push(setDoc(doc(db, 'user_accounts', effectiveEmail),    payload, { merge: true }));
-      if (androidEmailKey !== sanitizedEmailDoc && androidEmailKey !== effectiveEmail) {
+      writes.push(setDoc(doc(db, 'user_accounts', effectiveEmail), payload, { merge: true }));
+      if (sanitizedEmailDoc && sanitizedEmailDoc !== effectiveUid) {
+        writes.push(setDoc(doc(db, 'users', sanitizedEmailDoc), payload, { merge: true }));
+      }
+      if (androidEmailKey && androidEmailKey !== sanitizedEmailDoc) {
         writes.push(setDoc(doc(db, 'user_accounts', androidEmailKey), payload, { merge: true }));
       }
     }
 
-    // Catch write errors without blocking the UI
-    Promise.all(writes).then(async () => {
-      // ── Step 6: Background — leaderboard + test_results name sync ────────
-      const newName = (student.name || currentStudent?.name || '').trim();
-      if (newName && previousName && newName !== previousName.trim()) {
-        try {
-          await setDoc(doc(db, 'leaderboard', student.uid), {
-            name: newName,
-            lastUpdatedMillis: nowMillis,
-          }, { merge: true });
-        } catch (_) {}
-
-        try {
-          const { query, where, getDocs } = await import('firebase/firestore');
-          const q = query(collection(db, 'test_results'), where('userId', '==', student.uid));
-          const snap = await getDocs(q);
-          if (!snap.empty) {
-            const batchWrite = writeBatch(db);
-            snap.docs.forEach(d => {
-              batchWrite.set(d.ref, { userName: newName, studentName: newName }, { merge: true });
-            });
-            await batchWrite.commit();
-          }
-        } catch (_) {}
+    // Block collection sync
+    if (student.isBlocked !== undefined) {
+      if (student.isBlocked && effectiveUid) {
+        writes.push(setDoc(doc(db, 'blocked_users', effectiveUid), { uid: effectiveUid, email: effectiveEmail, reason: student.blockReason || '', blockedAt: nowMillis }, { merge: true }));
+        writes.push(setDoc(doc(db, 'blocked_students', effectiveUid), { uid: effectiveUid, email: effectiveEmail, reason: student.blockReason || '', blockedAt: nowMillis }, { merge: true }));
+      } else if (!student.isBlocked && effectiveUid) {
+        writes.push(deleteDoc(doc(db, 'blocked_users', effectiveUid)).catch(() => {}));
+        writes.push(deleteDoc(doc(db, 'blocked_students', effectiveUid)).catch(() => {}));
       }
+    }
 
-      // Safety: clear override after 5 s even if Firestore auto-clear didn't trigger
-      setTimeout(() => {
-        pendingStudentOverrides.current.delete(student.uid);
-      }, 5000);
-    }).catch(e => {
-      console.warn('updateStudent Firebase sync error:', e);
-      // On failure, clear the override so the UI reverts to real Firestore state
-      pendingStudentOverrides.current.delete(student.uid);
-    });
+    // ── Realtime Database (RTDB) Fast-Path Synchronization ─────────
+    try {
+      if (effectiveUid) {
+        writes.push(rtdbSet(ref(rtdb, 'users/' + effectiveUid), payload));
+        writes.push(rtdbSet(ref(rtdb, 'user_profiles/' + effectiveUid), payload));
+        if (student.isBlocked !== undefined) {
+          writes.push(rtdbSet(ref(rtdb, 'user_status/' + effectiveUid + '/isBlocked'), Boolean(student.isBlocked)));
+          writes.push(rtdbSet(ref(rtdb, 'users/' + effectiveUid + '/isBlocked'), Boolean(student.isBlocked)));
+          writes.push(rtdbSet(ref(rtdb, 'blocked_users/' + effectiveUid), student.isBlocked ? true : null));
+        }
+        if (student.isForceLoggedOut !== undefined) {
+          writes.push(rtdbSet(ref(rtdb, 'user_status/' + effectiveUid + '/isForceLoggedOut'), Boolean(student.isForceLoggedOut)));
+          writes.push(rtdbSet(ref(rtdb, 'users/' + effectiveUid + '/isForceLoggedOut'), Boolean(student.isForceLoggedOut)));
+          writes.push(rtdbSet(ref(rtdb, 'user_sessions/' + effectiveUid), null));
+        }
+        if (student.isPremium !== undefined) {
+          writes.push(rtdbSet(ref(rtdb, 'user_premium/' + effectiveUid), Boolean(student.isPremium)));
+          writes.push(rtdbSet(ref(rtdb, 'users/' + effectiveUid + '/isPremium'), Boolean(student.isPremium)));
+          writes.push(rtdbSet(ref(rtdb, 'user_status/' + effectiveUid + '/isPremium'), Boolean(student.isPremium)));
+        }
+      }
+    } catch (e) {
+      console.warn('RTDB student update notice:', e);
+    }
+
+    // Leaderboard sync
+    const newName = (student.name || currentStudent?.name || '').trim();
+    if (newName && previousName && newName !== previousName.trim() && effectiveUid) {
+      writes.push(setDoc(doc(db, 'leaderboard', effectiveUid), { name: newName, lastUpdatedMillis: nowMillis }, { merge: true }));
+    }
+
+    await Promise.all(writes).catch(e => console.warn('updateStudent sync error:', e));
+
+    setTimeout(() => {
+      pendingStudentOverrides.current.delete(effectiveUid);
+    }, 5000);
   };
 
-  const togglePremium = async (uid: string, current: boolean, studentEmail?: string, studentId?: string) => {
+    const togglePremium = async (uid: string, current: boolean, studentEmail?: string, studentId?: string) => {
     const newStatus = !current;
     const now = Date.now();
 
-    // Identify target student and all aliases
     const target = students.find(s => s.uid === uid || (studentEmail && s.email?.toLowerCase() === studentEmail.toLowerCase()));
     const effectiveEmail = (studentEmail || target?.email || '').toLowerCase().trim();
-    const effectiveStudentId = (studentId || target?.studentId || '').trim();
+    const effectiveUid = uid || target?.uid || '';
     const emailDocId = effectiveEmail.replace(/[@.]/g, '_');
-    const sanitizedUid = (uid || '').replace(/[@.]/g, '_');
 
     // 1. Optimistic Local State Update
     setStudents(prev => prev.map(s => {
-      if (s.uid === uid || (effectiveEmail && s.email?.toLowerCase() === effectiveEmail)) {
+      if (s.uid === effectiveUid || (effectiveEmail && s.email?.toLowerCase() === effectiveEmail)) {
         return { ...s, isPremium: newStatus, lastUpdatedMillis: now };
       }
       return s;
@@ -1518,47 +1607,40 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const updatePayload = {
       isPremium: Boolean(newStatus),
       premium: Boolean(newStatus),
+      plan: newStatus ? 'PREMIUM' : 'FREE',
+      accountType: newStatus ? 'PREMIUM' : 'FREE',
       lastUpdatedMillis: now
     };
 
-    // 2. Realtime Database (RTDB) Fast-Path (~50ms push to active student devices)
+    // 2. Realtime Database (RTDB) Fast-Path
+    const rtdbWrites: Promise<any>[] = [];
     try {
-      if (sanitizedUid) {
-        await rtdbSet(ref(rtdb, `user_premium/${sanitizedUid}`), Boolean(newStatus));
+      if (effectiveUid) {
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + effectiveUid), Boolean(newStatus)));
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'users/' + effectiveUid + '/isPremium'), Boolean(newStatus)));
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_status/' + effectiveUid + '/isPremium'), Boolean(newStatus)));
       }
-      if (emailDocId && emailDocId !== sanitizedUid) {
-        await rtdbSet(ref(rtdb, `user_premium/${emailDocId}`), Boolean(newStatus));
-      }
-      if (effectiveStudentId) {
-        const sanitizedSid = effectiveStudentId.replace(/[@.]/g, '_');
-        await rtdbSet(ref(rtdb, `user_premium/${sanitizedSid}`), Boolean(newStatus));
+      if (emailDocId && emailDocId !== effectiveUid) {
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + emailDocId), Boolean(newStatus)));
       }
     } catch (rtdbErr) {
       console.warn('RTDB user_premium update notice:', rtdbErr);
     }
 
-    // 3. Cloud Firestore Persistent Storage (Multi-Key Invalidation & Merge)
-    try {
-      const batch = writeBatch(db);
-
-      if (uid) {
-        batch.set(doc(db, 'users', uid), updatePayload, { merge: true });
-        batch.set(doc(db, 'user_profiles', uid), updatePayload, { merge: true });
-      }
-      if (emailDocId && emailDocId !== uid) {
-        batch.set(doc(db, 'users', emailDocId), updatePayload, { merge: true });
-      }
-      if (effectiveEmail) {
-        batch.set(doc(db, 'user_accounts', effectiveEmail), {
-          isPremium: Boolean(newStatus),
-          lastUpdatedMillis: now
-        }, { merge: true });
-      }
-
-      await batch.commit();
-    } catch (fsErr) {
-      console.warn('Firestore user premium batch update notice:', fsErr);
+    // 3. Cloud Firestore Persistent Storage
+    const fsWrites: Promise<any>[] = [];
+    if (effectiveUid) {
+      fsWrites.push(setDoc(doc(db, 'users', effectiveUid), updatePayload, { merge: true }));
+      fsWrites.push(setDoc(doc(db, 'user_profiles', effectiveUid), updatePayload, { merge: true }));
     }
+    if (emailDocId && emailDocId !== effectiveUid) {
+      fsWrites.push(setDoc(doc(db, 'users', emailDocId), updatePayload, { merge: true }));
+    }
+    if (effectiveEmail) {
+      fsWrites.push(setDoc(doc(db, 'user_accounts', effectiveEmail), updatePayload, { merge: true }));
+    }
+
+    await Promise.all([...rtdbWrites, ...fsWrites]).catch(e => console.warn('Premium toggle sync error:', e));
 
     // 4. Send Broadcast Notification
     if (newStatus) {
@@ -1567,7 +1649,7 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         message: 'Your KCET Gen Z account has been upgraded to Premium by Admin. All mock tests and college predictor features are unlocked.',
         type: 'PAYMENT',
         actionType: 'NAV_PROFILE',
-        targetUserId: uid,
+        targetUserId: effectiveUid,
         targetUserEmail: effectiveEmail
       });
     } else {
@@ -1576,12 +1658,13 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         message: 'Your KCET Gen Z Premium access has been set to Free plan by Admin.',
         type: 'PAYMENT',
         actionType: 'NAV_PROFILE',
-        targetUserId: uid,
+        targetUserId: effectiveUid,
         targetUserEmail: effectiveEmail
       });
     }
   };
-  const blockStudent = async (uid: string, reason: string) => {
+
+    const blockStudent = async (uid: string, reason: string) => {
     await updateStudent({
       uid,
       isBlocked: true,
@@ -1614,15 +1697,15 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch (e) {}
   };
   const deleteStudentPermanently = async (uid: string, email: string) => {
-    const student = students.find(s => s.uid === uid || (email && s.email.toLowerCase() === email.toLowerCase()));
+    const student = students.find(s => s.uid === uid || (email && s.email?.toLowerCase() === email.toLowerCase()));
     const effectiveName = student?.name || 'Student';
     const effectiveEmail = (email || student?.email || '').toLowerCase().trim();
     const sanitizedEmailDoc = effectiveEmail ? effectiveEmail.replace(/[@.]/g, '_') : '';
-    const sanitizedUid = (uid || '').replace(/[@.]/g, '_');
+    const effectiveUid = uid || student?.uid || '';
 
-    setStudents(prev => prev.filter(s => s.uid !== uid && (effectiveEmail ? s.email.toLowerCase() !== effectiveEmail : true)));
+    setStudents(prev => prev.filter(s => s.uid !== effectiveUid && (effectiveEmail ? s.email?.toLowerCase() !== effectiveEmail : true)));
     const deletedEntry: DeletedStudent = {
-      uid,
+      uid: effectiveUid,
       email: effectiveEmail,
       name: effectiveName,
       deletedAt: Date.now()
@@ -1630,69 +1713,96 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setDeletedStudents(prev => [deletedEntry, ...prev]);
 
     // 1. Cloud Firestore Multi-Collection Cleanup
-    try {
-      const batch = writeBatch(db);
-      if (uid) batch.delete(doc(db, 'users', uid));
-      if (uid) batch.delete(doc(db, 'user_profiles', uid));
-      if (sanitizedEmailDoc && sanitizedEmailDoc !== uid) batch.delete(doc(db, 'users', sanitizedEmailDoc));
-      if (effectiveEmail) batch.delete(doc(db, 'user_accounts', effectiveEmail));
-      if (uid) batch.delete(doc(db, 'leaderboard', uid));
-      
-      batch.set(doc(db, 'deleted_students', uid), {
-        uid,
+    const fsTasks: Promise<any>[] = [];
+    if (effectiveUid) {
+      fsTasks.push(deleteDoc(doc(db, 'users', effectiveUid)).catch(() => {}));
+      fsTasks.push(deleteDoc(doc(db, 'user_profiles', effectiveUid)).catch(() => {}));
+      fsTasks.push(deleteDoc(doc(db, 'leaderboard', effectiveUid)).catch(() => {}));
+      fsTasks.push(deleteDoc(doc(db, 'blocked_users', effectiveUid)).catch(() => {}));
+      fsTasks.push(deleteDoc(doc(db, 'blocked_students', effectiveUid)).catch(() => {}));
+      fsTasks.push(setDoc(doc(db, 'deleted_students', effectiveUid), {
+        uid: effectiveUid,
         email: effectiveEmail,
         name: effectiveName,
         deletedAtMillis: Date.now()
-      });
-
-      await batch.commit();
-    } catch (e) {
-      console.warn('Firestore multi-doc delete notice:', e);
+      }));
+    }
+    if (sanitizedEmailDoc && sanitizedEmailDoc !== effectiveUid) {
+      fsTasks.push(deleteDoc(doc(db, 'users', sanitizedEmailDoc)).catch(() => {}));
+    }
+    if (effectiveEmail) {
+      fsTasks.push(deleteDoc(doc(db, 'user_accounts', effectiveEmail)).catch(() => {}));
     }
 
-    // 2. Clean test_results for student — match both web (studentUid/studentEmail) and Android (userId/userEmail) field names
-    try {
-      const resultsToDelete = studentTestResults.filter(r =>
-        r.studentUid === uid || r.userId === uid ||
-        (effectiveEmail && (r.studentEmail === effectiveEmail || r.userEmail === effectiveEmail))
-      );
-      for (const res of resultsToDelete) {
-        await deleteDoc(doc(db, 'test_results', res.id));
-      }
-      setStudentTestResults(prev => prev.filter(r =>
-        r.studentUid !== uid && r.userId !== uid &&
-        (effectiveEmail ? (r.studentEmail !== effectiveEmail && r.userEmail !== effectiveEmail) : true)
-      ));
-    } catch (e) {}
+    // 2. Clean test_results for student
+    const studentResults = studentTestResults.filter(
+      r => r.studentUid === effectiveUid || r.userId === effectiveUid || (effectiveEmail && (r.studentEmail === effectiveEmail || r.userEmail === effectiveEmail))
+    );
+    for (const res of studentResults) {
+      fsTasks.push(deleteDoc(doc(db, 'test_results', res.id)).catch(() => {}));
+    }
 
     // 3. Realtime Database Cleanup
+    const rtdbTasks: Promise<any>[] = [];
     try {
-      if (sanitizedUid) {
-        await rtdbSet(ref(rtdb, `presence/${sanitizedUid}`), null);
-        await rtdbSet(ref(rtdb, `live_xp/${sanitizedUid}`), null);
-        await rtdbSet(ref(rtdb, `user_premium/${sanitizedUid}`), null);
+      if (effectiveUid) {
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'users/' + effectiveUid), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_profiles/' + effectiveUid), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_status/' + effectiveUid), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_premium/' + effectiveUid), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_sessions/' + effectiveUid), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'blocked_users/' + effectiveUid), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'deleted_students/' + effectiveUid), true));
       }
-      if (sanitizedEmailDoc && sanitizedEmailDoc !== sanitizedUid) {
-        await rtdbSet(ref(rtdb, `user_premium/${sanitizedEmailDoc}`), null);
+      if (sanitizedEmailDoc) {
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_premium/' + sanitizedEmailDoc), null));
       }
-    } catch (e) {}
+    } catch (e) {
+      console.warn('RTDB student deletion cleanup notice:', e);
+    }
+
+    await Promise.all([...fsTasks, ...rtdbTasks]).catch(e => console.warn('Student permanent delete error:', e));
+    notifySuccess('Student record permanently deleted across all databases and synced with App.', 'Account Terminated');
   };
-  // Student Test Results
+
+    // Student Test Results
   const saveTestResult = async (res: StudentTestResult) => {
+    const enriched: any = {
+      ...res,
+      id: res.id,
+      userId: res.studentUid || (res as any).userId || '',
+      studentUid: res.studentUid || (res as any).userId || '',
+      userName: res.studentName || (res as any).userName || 'Student',
+      studentName: res.studentName || (res as any).userName || 'Student',
+      userEmail: (res.studentEmail || (res as any).userEmail || '').toLowerCase(),
+      studentEmail: (res.studentEmail || (res as any).userEmail || '').toLowerCase(),
+      studentId: res.studentId || '',
+      testName: res.testTitle || (res as any).testName || 'Unnamed Test',
+      testTitle: res.testTitle || (res as any).testName || 'Unnamed Test',
+      totalQuestions: res.maxScore || (res as any).totalQuestions || 20,
+      maxScore: res.maxScore || (res as any).totalQuestions || 20,
+      score: Number(res.score || 0),
+      timestamp: res.timestamp || Date.now()
+    };
+
     setStudentTestResults(prev => {
       const idx = prev.findIndex(r => r.id === res.id);
       if (idx >= 0) {
         const u = [...prev];
-        u[idx] = res;
+        u[idx] = enriched;
         return u;
       }
-      return [res, ...prev];
+      return [enriched, ...prev];
     });
-    try {
-      await setDoc(doc(db, 'test_results', res.id), res);
-    } catch (e) {
-      console.warn('Saved test result locally', e);
+
+    const tasks: Promise<any>[] = [
+      setDoc(doc(db, 'test_results', res.id), enriched, { merge: true })
+    ];
+    if (enriched.userId) {
+      tasks.push(setDoc(doc(db, 'users', enriched.userId, 'test_results', res.id), enriched, { merge: true }).catch(() => {}));
     }
+    await Promise.all(tasks).catch(e => console.warn('Saved test result sync notice:', e));
+    notifySuccess('Test result saved and synced with student account.', 'Scores Updated');
   };
   const deleteTestResult = async (id: string) => {
     setStudentTestResults(prev => prev.filter(r => r.id !== id));

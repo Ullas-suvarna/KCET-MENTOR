@@ -1730,10 +1730,10 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const safeUidKey     = toSafeKey(effectiveUid);
     const safeEmailKey   = toSafeEmailKey(effectiveEmail);
 
-    // 1. Optimistic Local State Update
+    // 1. Optimistic Local State Update (marks student as force logged out so UI and app are in sync)
     setStudents(prev => prev.map(s => {
       if (s.uid === effectiveUid || (effectiveEmail && s.email?.toLowerCase() === effectiveEmail)) {
-        return { ...s, isPremium: newStatus, lastUpdatedMillis: now };
+        return { ...s, isPremium: newStatus, isForceLoggedOut: true, lastUpdatedMillis: now };
       }
       return s;
     }));
@@ -1747,11 +1747,18 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
     }
 
+    // 1. Prepare Update Data (Sets isForceLoggedOut to true to force student to log back in with new status)
     const updatePayload = {
       isPremium: Boolean(newStatus),
       premium: Boolean(newStatus),
       plan: newStatus ? 'PREMIUM' : 'FREE',
       accountType: newStatus ? 'PREMIUM' : 'FREE',
+      isForceLoggedOut: true,
+      forceLogout: true,
+      status: "ACTIVE", // Ensures account is ACTIVE and not BLOCKED
+      accountStatus: "ACTIVE",
+      sessionValid: false,
+      lastForceLogoutTime: now,
       lastUpdatedMillis: now
     };
 
@@ -1761,6 +1768,8 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       studentId: sid,
       isPremium: Boolean(newStatus),
       premium: Boolean(newStatus),
+      isForceLoggedOut: true,
+      status: "ACTIVE",
       lastUpdatedMillis: now
     };
 
@@ -1781,16 +1790,32 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       keysToUpdate.add(toSafeKey(sid.replace(/-/g, '')).toLowerCase());
     }
 
-    // 2. Realtime Database (RTDB) The Instant Switch (< 50ms)
+    // Status node payload for RTDB — triggers immediate logout in MainViewModel
+    const statusData = {
+      isForceLoggedOut: true,
+      forceLogout: true,
+      isBlocked: false,
+      blocked: false,
+      status: "ACTIVE",
+      isPremium: Boolean(newStatus),
+      updatedAt: now,
+      lastUpdatedMillis: now
+    };
+
+    // 2. Realtime Database (RTDB) The Instant Signal & Force Logout (< 50ms)
     const rtdbWrites: Promise<any>[] = [];
     try {
       for (const k of keysToUpdate) {
+        // Update Premium Node
         rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + k), Boolean(newStatus)));
         rtdbWrites.push(rtdbSet(ref(rtdb, 'users/' + k + '/isPremium'), Boolean(newStatus)));
-        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_status/' + k + '/isPremium'), Boolean(newStatus)));
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'users/' + k + '/isForceLoggedOut'), true));
+        // Update Status Node (Triggers instant logout on phone)
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_status/' + k), statusData));
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_sessions/' + k), null));
       }
     } catch (rtdbErr) {
-      console.warn('RTDB user_premium update notice:', rtdbErr);
+      console.warn('RTDB user_premium and user_status update notice:', rtdbErr);
     }
 
     // 3. Cloud Firestore Persistent Storage (SetOptions.merge: true is mandatory)
@@ -1845,7 +1870,7 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     if (newStatus) {
       await sendBroadcast({
         title: '👑 Premium Access Granted!',
-        message: 'Your KCET Gen Z account has been upgraded to Premium by Admin. All mock tests and college predictor features are unlocked.',
+        message: 'Your KCET Gen Z account has been upgraded to Premium by Admin. Please log back in to activate your unlocked test series and predictor features.',
         type: 'PAYMENT',
         actionType: 'NAV_PROFILE',
         targetUserId: effectiveUid,
@@ -1854,7 +1879,7 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } else {
       await sendBroadcast({
         title: 'Premium Access Revoked',
-        message: 'Your KCET Gen Z Premium access has been set to Free plan by Admin.',
+        message: 'Your KCET Gen Z Premium access has been set to Free plan by Admin. Please log back in.',
         type: 'PAYMENT',
         actionType: 'NAV_PROFILE',
         targetUserId: effectiveUid,
@@ -1863,7 +1888,7 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   };
 
-    const blockStudent = async (uid: string, reason: string, studentEmail?: string) => {
+      const blockStudent = async (uid: string, reason: string, studentEmail?: string) => {
     const target = students.find(s => s.uid === uid || (studentEmail && s.email?.toLowerCase() === studentEmail.toLowerCase()));
     await updateStudent({
       uid,

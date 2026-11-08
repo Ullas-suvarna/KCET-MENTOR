@@ -47,6 +47,8 @@ import { ToastContainer, ToastItem, ToastType } from '../components/common/Toast
 import { ConfirmModal, ConfirmDialogState } from '../components/common/ConfirmModal';
 import { db, rtdb, collection, doc, setDoc, deleteDoc, updateDoc, onSnapshot, writeBatch, ref, rtdbSet, onValue, ADMIN_IDENTIFIER } from '../services/firebase';
 import { deduplicateStudentProfiles } from '../utils/studentDedup';
+
+const toSafeKey = (str: string) => (str || '').toLowerCase().trim().replace(/[.@#$[\]]/g, '_');
 interface AdminDataContextType {
   // Auth
   isAuthenticated: boolean;
@@ -96,9 +98,9 @@ interface AdminDataContextType {
   deleteNotification: (id: string) => Promise<void>;
   updateStudent: (student: Partial<User> & { uid: string }) => Promise<void>;
   togglePremium: (uid: string, current: boolean, email?: string, studentId?: string) => Promise<void>;
-  blockStudent: (uid: string, reason: string) => Promise<void>;
-  unblockStudent: (uid: string) => Promise<void>;
-  forceLogoutStudent: (uid: string) => Promise<void>;
+  blockStudent: (uid: string, reason: string, email?: string) => Promise<void>;
+  unblockStudent: (uid: string, email?: string) => Promise<void>;
+  forceLogoutStudent: (uid: string, email?: string) => Promise<void>;
   forceLogoutAllStudents: () => Promise<void>;
   deleteStudentPermanently: (uid: string, email: string) => Promise<void>;
   saveTestResult: (res: StudentTestResult) => Promise<void>;
@@ -673,16 +675,17 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         console.warn('Challenge listeners notice:', e);
       }
       // 10. Users / Students — Multi-source merge with full deduplication
-      // Combines /users + /user_accounts + /user_profiles (shared Android schema) through the
+      // Combines /users + /user_accounts + /user_profiles + /premium_students through the
       // 5-way clustering algorithm and filters /deleted_students in real time.
       {
         let rawUsers:    (Partial<User> & { docId?: string })[] = [];
         let rawAccounts: (Partial<User> & { docId?: string })[] = [];
         let rawProfiles: (Partial<User> & { docId?: string })[] = [];
+        let rawPremium:  (Partial<User> & { docId?: string })[] = [];
         let deletedSet:  Set<string> = new Set();
 
         const mergeAndEmit = () => {
-          const combined = [...rawUsers, ...rawAccounts, ...rawProfiles];
+          const combined = [...rawUsers, ...rawAccounts, ...rawProfiles, ...rawPremium];
           let unique: User[] = deduplicateStudentProfiles(combined, deletedSet);
 
           // Apply any pending admin overrides so the UI reflects edits instantly.
@@ -724,13 +727,19 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           mergeAndEmit();
         }, () => {}));
 
-        // 10d. /deleted_students — reactive filter + state sync
+        // 10d. /premium_students (registry of active/revoked premium students)
+        unsubs.push(onSnapshot(collection(db, 'premium_students'), (snap) => {
+          rawPremium = snap.docs.map(d => ({ docId: d.id, ...(d.data() as any) }));
+          mergeAndEmit();
+        }, () => {}));
+
+        // 10e. /deleted_students — reactive filter + state sync
         unsubs.push(onSnapshot(collection(db, 'deleted_students'), (snap) => {
           deletedSet = new Set(snap.docs.flatMap(d => {
             const data = d.data() as any;
-            const entries = [d.id.trim()];
-            if (data.uid)   entries.push((data.uid   as string).trim());
-            if (data.email) entries.push((data.email as string).trim().toLowerCase());
+            const entries = [d.id.trim(), d.id.trim().toLowerCase()];
+            if (data.uid)   { entries.push((data.uid   as string).trim()); entries.push((data.uid   as string).trim().toLowerCase()); }
+            if (data.email) { entries.push((data.email as string).trim().toLowerCase()); entries.push(toSafeKey(data.email)); }
             return entries;
           }));
           setDeletedStudents(snap.docs.map(d => d.data() as DeletedStudent));
@@ -1376,10 +1385,30 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         ];
         // If targeted to a specific student, write to their personal subcollection & RTDB so their app catches it instantly
         if (isTargeted && resolvedTargetUserId !== 'ALL') {
-          notifTasks.push(setDoc(doc(db, 'users', resolvedTargetUserId, 'notifications', notifId), newNotif, { merge: true }).catch(() => {}));
-          notifTasks.push(setDoc(doc(db, 'user_notifications', resolvedTargetUserId, 'notifications', notifId), newNotif, { merge: true }).catch(() => {}));
+          const targetSafeUid = toSafeKey(resolvedTargetUserId);
+          const targetSafeEmail = toSafeKey(resolvedTargetUserEmail);
+
+          if (resolvedTargetUserId) {
+            notifTasks.push(setDoc(doc(db, 'users', resolvedTargetUserId, 'notifications', notifId), newNotif, { merge: true }).catch(() => {}));
+            notifTasks.push(setDoc(doc(db, 'user_notifications', resolvedTargetUserId, 'notifications', notifId), newNotif, { merge: true }).catch(() => {}));
+          }
+          if (targetSafeEmail && targetSafeEmail !== resolvedTargetUserId) {
+            notifTasks.push(setDoc(doc(db, 'users', targetSafeEmail, 'notifications', notifId), newNotif, { merge: true }).catch(() => {}));
+            notifTasks.push(setDoc(doc(db, 'user_notifications', targetSafeEmail, 'notifications', notifId), newNotif, { merge: true }).catch(() => {}));
+          }
+          if (resolvedTargetUserEmail) {
+            notifTasks.push(setDoc(doc(db, 'user_accounts', resolvedTargetUserEmail, 'notifications', notifId), newNotif, { merge: true }).catch(() => {}));
+          }
           try {
-            notifTasks.push(rtdbSet(ref(rtdb, 'user_notifications/' + resolvedTargetUserId + '/' + notifId), newNotif));
+            if (targetSafeUid) {
+              notifTasks.push(rtdbSet(ref(rtdb, 'user_notifications/' + targetSafeUid + '/' + notifId), newNotif));
+              notifTasks.push(rtdbSet(ref(rtdb, 'users/' + targetSafeUid + '/lastNotification'), newNotif));
+            }
+            if (targetSafeEmail) {
+              notifTasks.push(rtdbSet(ref(rtdb, 'user_notifications/' + targetSafeEmail + '/' + notifId), newNotif));
+              notifTasks.push(rtdbSet(ref(rtdb, 'users/' + targetSafeEmail + '/lastNotification'), newNotif));
+            }
+            notifTasks.push(rtdbSet(ref(rtdb, 'notifications/' + notifId), newNotif));
           } catch (_) {}
         }
         await Promise.all(notifTasks);
@@ -1426,6 +1455,8 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const previousName   = currentStudent?.name;
     const effectiveEmail = (student.email || currentStudent?.email || '').toLowerCase().trim();
     const effectiveUid   = student.uid || currentStudent?.uid || '';
+    const safeUidKey     = toSafeKey(effectiveUid);
+    const safeEmailKey   = toSafeKey(effectiveEmail);
 
     // Build comprehensive multi-platform payload covering all Android field aliases
     const payload: Record<string, unknown> = {
@@ -1520,54 +1551,112 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     });
 
     // ── Firestore Multi-Target Writes ──────────────────────────────
-    const sanitizedEmailDoc = effectiveEmail ? effectiveEmail.replace(/[@.]/g, '_') : '';
-    const androidEmailKey   = effectiveEmail ? effectiveEmail.replace('.', '_').replace('@', '_') : '';
-
     const writes: Promise<any>[] = [];
     if (effectiveUid) {
       writes.push(setDoc(doc(db, 'users', effectiveUid), payload, { merge: true }));
       writes.push(setDoc(doc(db, 'user_profiles', effectiveUid), payload, { merge: true }));
     }
+    if (safeEmailKey && safeEmailKey !== effectiveUid) {
+      writes.push(setDoc(doc(db, 'users', safeEmailKey), payload, { merge: true }));
+      writes.push(setDoc(doc(db, 'user_profiles', safeEmailKey), payload, { merge: true }));
+    }
     if (effectiveEmail) {
       writes.push(setDoc(doc(db, 'user_accounts', effectiveEmail), payload, { merge: true }));
-      if (sanitizedEmailDoc && sanitizedEmailDoc !== effectiveUid) {
-        writes.push(setDoc(doc(db, 'users', sanitizedEmailDoc), payload, { merge: true }));
-      }
-      if (androidEmailKey && androidEmailKey !== sanitizedEmailDoc) {
-        writes.push(setDoc(doc(db, 'user_accounts', androidEmailKey), payload, { merge: true }));
+      if (safeEmailKey && safeEmailKey !== effectiveEmail) {
+        writes.push(setDoc(doc(db, 'user_accounts', safeEmailKey), payload, { merge: true }));
       }
     }
 
     // Block collection sync
     if (student.isBlocked !== undefined) {
-      if (student.isBlocked && effectiveUid) {
-        writes.push(setDoc(doc(db, 'blocked_users', effectiveUid), { uid: effectiveUid, email: effectiveEmail, reason: student.blockReason || '', blockedAt: nowMillis }, { merge: true }));
-        writes.push(setDoc(doc(db, 'blocked_students', effectiveUid), { uid: effectiveUid, email: effectiveEmail, reason: student.blockReason || '', blockedAt: nowMillis }, { merge: true }));
-      } else if (!student.isBlocked && effectiveUid) {
-        writes.push(deleteDoc(doc(db, 'blocked_users', effectiveUid)).catch(() => {}));
-        writes.push(deleteDoc(doc(db, 'blocked_students', effectiveUid)).catch(() => {}));
+      if (student.isBlocked) {
+        if (effectiveUid) {
+          writes.push(setDoc(doc(db, 'blocked_users', effectiveUid), { uid: effectiveUid, email: effectiveEmail, reason: student.blockReason || '', blockedAt: nowMillis }, { merge: true }));
+          writes.push(setDoc(doc(db, 'blocked_students', effectiveUid), { uid: effectiveUid, email: effectiveEmail, reason: student.blockReason || '', blockedAt: nowMillis }, { merge: true }));
+        }
+        if (safeEmailKey && safeEmailKey !== effectiveUid) {
+          writes.push(setDoc(doc(db, 'blocked_users', safeEmailKey), { uid: effectiveUid, email: effectiveEmail, reason: student.blockReason || '', blockedAt: nowMillis }, { merge: true }));
+          writes.push(setDoc(doc(db, 'blocked_students', safeEmailKey), { uid: effectiveUid, email: effectiveEmail, reason: student.blockReason || '', blockedAt: nowMillis }, { merge: true }));
+        }
+      } else {
+        if (effectiveUid) {
+          writes.push(deleteDoc(doc(db, 'blocked_users', effectiveUid)).catch(() => {}));
+          writes.push(deleteDoc(doc(db, 'blocked_students', effectiveUid)).catch(() => {}));
+        }
+        if (safeEmailKey) {
+          writes.push(deleteDoc(doc(db, 'blocked_users', safeEmailKey)).catch(() => {}));
+          writes.push(deleteDoc(doc(db, 'blocked_students', safeEmailKey)).catch(() => {}));
+        }
       }
     }
 
-    // ── Realtime Database (RTDB) Fast-Path Synchronization ─────────
+    // Premium collections sync if premium status provided
+    if (student.isPremium !== undefined) {
+      const premDoc = {
+        uid: effectiveUid,
+        email: effectiveEmail,
+        studentId: sid || '',
+        isPremium: Boolean(student.isPremium),
+        lastUpdatedMillis: nowMillis
+      };
+      if (effectiveUid) writes.push(setDoc(doc(db, 'premium_students', effectiveUid), premDoc, { merge: true }));
+      if (effectiveEmail) writes.push(setDoc(doc(db, 'premium_students', effectiveEmail), premDoc, { merge: true }));
+      if (safeEmailKey && safeEmailKey !== effectiveUid && safeEmailKey !== effectiveEmail) {
+        writes.push(setDoc(doc(db, 'premium_students', safeEmailKey), premDoc, { merge: true }));
+      }
+    }
+
+    // ── Realtime Database (RTDB) Fast-Path Synchronization (< 50ms) ─
     try {
-      if (effectiveUid) {
-        writes.push(rtdbSet(ref(rtdb, 'users/' + effectiveUid), payload));
-        writes.push(rtdbSet(ref(rtdb, 'user_profiles/' + effectiveUid), payload));
-        if (student.isBlocked !== undefined) {
-          writes.push(rtdbSet(ref(rtdb, 'user_status/' + effectiveUid + '/isBlocked'), Boolean(student.isBlocked)));
-          writes.push(rtdbSet(ref(rtdb, 'users/' + effectiveUid + '/isBlocked'), Boolean(student.isBlocked)));
-          writes.push(rtdbSet(ref(rtdb, 'blocked_users/' + effectiveUid), student.isBlocked ? true : null));
+      if (safeUidKey) {
+        writes.push(rtdbSet(ref(rtdb, 'users/' + safeUidKey), payload));
+        writes.push(rtdbSet(ref(rtdb, 'user_profiles/' + safeUidKey), payload));
+      }
+      if (safeEmailKey && safeEmailKey !== safeUidKey) {
+        writes.push(rtdbSet(ref(rtdb, 'users/' + safeEmailKey), payload));
+        writes.push(rtdbSet(ref(rtdb, 'user_profiles/' + safeEmailKey), payload));
+      }
+
+      if (student.isBlocked !== undefined || student.isForceLoggedOut !== undefined) {
+        const isBlk = student.isBlocked !== undefined ? Boolean(student.isBlocked) : (currentStudent?.isBlocked ?? false);
+        const isLgt = student.isForceLoggedOut !== undefined ? Boolean(student.isForceLoggedOut) : isBlk;
+        const statusObj = {
+          isBlocked: isBlk,
+          blocked: isBlk,
+          status: isBlk ? 'BLOCKED' : 'ACTIVE',
+          blockReason: isBlk ? (student.blockReason || currentStudent?.blockReason || 'Account blocked by Administrator.') : '',
+          isForceLoggedOut: isLgt,
+          forceLogout: isLgt,
+          lastUpdatedMillis: nowMillis
+        };
+
+        if (safeUidKey) {
+          writes.push(rtdbSet(ref(rtdb, 'user_status/' + safeUidKey), statusObj));
+          writes.push(rtdbSet(ref(rtdb, 'users/' + safeUidKey + '/isBlocked'), isBlk));
+          writes.push(rtdbSet(ref(rtdb, 'users/' + safeUidKey + '/isForceLoggedOut'), isLgt));
+          writes.push(rtdbSet(ref(rtdb, 'blocked_users/' + safeUidKey), isBlk ? true : null));
+          if (isLgt) writes.push(rtdbSet(ref(rtdb, 'user_sessions/' + safeUidKey), null));
         }
-        if (student.isForceLoggedOut !== undefined) {
-          writes.push(rtdbSet(ref(rtdb, 'user_status/' + effectiveUid + '/isForceLoggedOut'), Boolean(student.isForceLoggedOut)));
-          writes.push(rtdbSet(ref(rtdb, 'users/' + effectiveUid + '/isForceLoggedOut'), Boolean(student.isForceLoggedOut)));
-          writes.push(rtdbSet(ref(rtdb, 'user_sessions/' + effectiveUid), null));
+        if (safeEmailKey) {
+          writes.push(rtdbSet(ref(rtdb, 'user_status/' + safeEmailKey), statusObj));
+          writes.push(rtdbSet(ref(rtdb, 'users/' + safeEmailKey + '/isBlocked'), isBlk));
+          writes.push(rtdbSet(ref(rtdb, 'users/' + safeEmailKey + '/isForceLoggedOut'), isLgt));
+          writes.push(rtdbSet(ref(rtdb, 'blocked_users/' + safeEmailKey), isBlk ? true : null));
+          if (isLgt) writes.push(rtdbSet(ref(rtdb, 'user_sessions/' + safeEmailKey), null));
         }
-        if (student.isPremium !== undefined) {
-          writes.push(rtdbSet(ref(rtdb, 'user_premium/' + effectiveUid), Boolean(student.isPremium)));
-          writes.push(rtdbSet(ref(rtdb, 'users/' + effectiveUid + '/isPremium'), Boolean(student.isPremium)));
-          writes.push(rtdbSet(ref(rtdb, 'user_status/' + effectiveUid + '/isPremium'), Boolean(student.isPremium)));
+      }
+
+      if (student.isPremium !== undefined) {
+        const isPrem = Boolean(student.isPremium);
+        if (safeUidKey) {
+          writes.push(rtdbSet(ref(rtdb, 'user_premium/' + safeUidKey), isPrem));
+          writes.push(rtdbSet(ref(rtdb, 'users/' + safeUidKey + '/isPremium'), isPrem));
+          writes.push(rtdbSet(ref(rtdb, 'user_status/' + safeUidKey + '/isPremium'), isPrem));
+        }
+        if (safeEmailKey) {
+          writes.push(rtdbSet(ref(rtdb, 'user_premium/' + safeEmailKey), isPrem));
+          writes.push(rtdbSet(ref(rtdb, 'users/' + safeEmailKey + '/isPremium'), isPrem));
+          writes.push(rtdbSet(ref(rtdb, 'user_status/' + safeEmailKey + '/isPremium'), isPrem));
         }
       }
     } catch (e) {
@@ -1576,8 +1665,9 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     // Leaderboard sync
     const newName = (student.name || currentStudent?.name || '').trim();
-    if (newName && previousName && newName !== previousName.trim() && effectiveUid) {
-      writes.push(setDoc(doc(db, 'leaderboard', effectiveUid), { name: newName, lastUpdatedMillis: nowMillis }, { merge: true }));
+    if (newName && previousName && newName !== previousName.trim()) {
+      if (effectiveUid) writes.push(setDoc(doc(db, 'leaderboard', effectiveUid), { name: newName, lastUpdatedMillis: nowMillis }, { merge: true }));
+      if (safeEmailKey) writes.push(setDoc(doc(db, 'leaderboard', safeEmailKey), { name: newName, lastUpdatedMillis: nowMillis }, { merge: true }));
     }
 
     await Promise.all(writes).catch(e => console.warn('updateStudent sync error:', e));
@@ -1587,14 +1677,16 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }, 5000);
   };
 
-    const togglePremium = async (uid: string, current: boolean, studentEmail?: string, studentId?: string) => {
+  const togglePremium = async (uid: string, current: boolean, studentEmail?: string, studentId?: string) => {
     const newStatus = !current;
     const now = Date.now();
 
     const target = students.find(s => s.uid === uid || (studentEmail && s.email?.toLowerCase() === studentEmail.toLowerCase()));
     const effectiveEmail = (studentEmail || target?.email || '').toLowerCase().trim();
-    const effectiveUid = uid || target?.uid || '';
-    const emailDocId = effectiveEmail.replace(/[@.]/g, '_');
+    const effectiveUid   = uid || target?.uid || '';
+    const sid = studentId || target?.formattedStudentId || target?.studentId || '';
+    const safeUidKey     = toSafeKey(effectiveUid);
+    const safeEmailKey   = toSafeKey(effectiveEmail);
 
     // 1. Optimistic Local State Update
     setStudents(prev => prev.map(s => {
@@ -1612,32 +1704,49 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       lastUpdatedMillis: now
     };
 
-    // 2. Realtime Database (RTDB) Fast-Path
+    const premStudentDoc = {
+      uid: effectiveUid,
+      email: effectiveEmail,
+      studentId: sid,
+      isPremium: Boolean(newStatus),
+      lastUpdatedMillis: now
+    };
+
+    // 2. Realtime Database (RTDB) Fast-Path (< 50ms)
     const rtdbWrites: Promise<any>[] = [];
     try {
-      if (effectiveUid) {
-        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + effectiveUid), Boolean(newStatus)));
-        rtdbWrites.push(rtdbSet(ref(rtdb, 'users/' + effectiveUid + '/isPremium'), Boolean(newStatus)));
-        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_status/' + effectiveUid + '/isPremium'), Boolean(newStatus)));
+      if (safeUidKey) {
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + safeUidKey), Boolean(newStatus)));
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'users/' + safeUidKey + '/isPremium'), Boolean(newStatus)));
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_status/' + safeUidKey + '/isPremium'), Boolean(newStatus)));
       }
-      if (emailDocId && emailDocId !== effectiveUid) {
-        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + emailDocId), Boolean(newStatus)));
+      if (safeEmailKey) {
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + safeEmailKey), Boolean(newStatus)));
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'users/' + safeEmailKey + '/isPremium'), Boolean(newStatus)));
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_status/' + safeEmailKey + '/isPremium'), Boolean(newStatus)));
       }
     } catch (rtdbErr) {
       console.warn('RTDB user_premium update notice:', rtdbErr);
     }
 
-    // 3. Cloud Firestore Persistent Storage
+    // 3. Cloud Firestore Persistent Storage (SetOptions.merge: true)
     const fsWrites: Promise<any>[] = [];
     if (effectiveUid) {
       fsWrites.push(setDoc(doc(db, 'users', effectiveUid), updatePayload, { merge: true }));
       fsWrites.push(setDoc(doc(db, 'user_profiles', effectiveUid), updatePayload, { merge: true }));
+      fsWrites.push(setDoc(doc(db, 'premium_students', effectiveUid), premStudentDoc, { merge: true }));
     }
-    if (emailDocId && emailDocId !== effectiveUid) {
-      fsWrites.push(setDoc(doc(db, 'users', emailDocId), updatePayload, { merge: true }));
+    if (safeEmailKey && safeEmailKey !== effectiveUid) {
+      fsWrites.push(setDoc(doc(db, 'users', safeEmailKey), updatePayload, { merge: true }));
+      fsWrites.push(setDoc(doc(db, 'user_profiles', safeEmailKey), updatePayload, { merge: true }));
+      fsWrites.push(setDoc(doc(db, 'premium_students', safeEmailKey), premStudentDoc, { merge: true }));
     }
     if (effectiveEmail) {
       fsWrites.push(setDoc(doc(db, 'user_accounts', effectiveEmail), updatePayload, { merge: true }));
+      fsWrites.push(setDoc(doc(db, 'premium_students', effectiveEmail), premStudentDoc, { merge: true }));
+      if (safeEmailKey && safeEmailKey !== effectiveEmail) {
+        fsWrites.push(setDoc(doc(db, 'user_accounts', safeEmailKey), updatePayload, { merge: true }));
+      }
     }
 
     await Promise.all([...rtdbWrites, ...fsWrites]).catch(e => console.warn('Premium toggle sync error:', e));
@@ -1664,44 +1773,59 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   };
 
-    const blockStudent = async (uid: string, reason: string) => {
+  const blockStudent = async (uid: string, reason: string, studentEmail?: string) => {
+    const target = students.find(s => s.uid === uid || (studentEmail && s.email?.toLowerCase() === studentEmail.toLowerCase()));
     await updateStudent({
       uid,
+      email: studentEmail || target?.email || '',
       isBlocked: true,
       blockReason: reason,
       isForceLoggedOut: true
     });
   };
-  const unblockStudent = async (uid: string) => {
+
+  const unblockStudent = async (uid: string, studentEmail?: string) => {
+    const target = students.find(s => s.uid === uid || (studentEmail && s.email?.toLowerCase() === studentEmail.toLowerCase()));
     await updateStudent({
       uid,
+      email: studentEmail || target?.email || '',
       isBlocked: false,
       blockReason: ''
     });
   };
-  const forceLogoutStudent = async (uid: string) => {
+
+  const forceLogoutStudent = async (uid: string, studentEmail?: string) => {
+    const target = students.find(s => s.uid === uid || (studentEmail && s.email?.toLowerCase() === studentEmail.toLowerCase()));
     await updateStudent({
       uid,
+      email: studentEmail || target?.email || '',
       isForceLoggedOut: true
     });
   };
+
   const forceLogoutAllStudents = async () => {
     setStudents(prev => prev.map(s => ({ ...s, isForceLoggedOut: true })));
     for (const s of students) {
       try {
         await updateDoc(doc(db, 'users', s.uid), { isForceLoggedOut: true });
+        const safeK = toSafeKey(s.uid);
+        const safeEm = toSafeKey(s.email);
+        if (safeK) await rtdbSet(ref(rtdb, 'user_status/' + safeK + '/isForceLoggedOut'), true);
+        if (safeEm) await rtdbSet(ref(rtdb, 'user_status/' + safeEm + '/isForceLoggedOut'), true);
       } catch (e) {}
     }
     try {
       await rtdbSet(ref(rtdb, 'system_config/force_logout_all'), true);
     } catch (e) {}
   };
+
   const deleteStudentPermanently = async (uid: string, email: string) => {
     const student = students.find(s => s.uid === uid || (email && s.email?.toLowerCase() === email.toLowerCase()));
     const effectiveName = student?.name || 'Student';
     const effectiveEmail = (email || student?.email || '').toLowerCase().trim();
-    const sanitizedEmailDoc = effectiveEmail ? effectiveEmail.replace(/[@.]/g, '_') : '';
-    const effectiveUid = uid || student?.uid || '';
+    const effectiveUid   = uid || student?.uid || '';
+    const safeUidKey     = toSafeKey(effectiveUid);
+    const safeEmailKey   = toSafeKey(effectiveEmail);
 
     setStudents(prev => prev.filter(s => s.uid !== effectiveUid && (effectiveEmail ? s.email?.toLowerCase() !== effectiveEmail : true)));
     const deletedEntry: DeletedStudent = {
@@ -1720,6 +1844,7 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       fsTasks.push(deleteDoc(doc(db, 'leaderboard', effectiveUid)).catch(() => {}));
       fsTasks.push(deleteDoc(doc(db, 'blocked_users', effectiveUid)).catch(() => {}));
       fsTasks.push(deleteDoc(doc(db, 'blocked_students', effectiveUid)).catch(() => {}));
+      fsTasks.push(deleteDoc(doc(db, 'premium_students', effectiveUid)).catch(() => {}));
       fsTasks.push(setDoc(doc(db, 'deleted_students', effectiveUid), {
         uid: effectiveUid,
         email: effectiveEmail,
@@ -1727,11 +1852,22 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         deletedAtMillis: Date.now()
       }));
     }
-    if (sanitizedEmailDoc && sanitizedEmailDoc !== effectiveUid) {
-      fsTasks.push(deleteDoc(doc(db, 'users', sanitizedEmailDoc)).catch(() => {}));
+    if (safeEmailKey && safeEmailKey !== effectiveUid) {
+      fsTasks.push(deleteDoc(doc(db, 'users', safeEmailKey)).catch(() => {}));
+      fsTasks.push(deleteDoc(doc(db, 'user_profiles', safeEmailKey)).catch(() => {}));
+      fsTasks.push(deleteDoc(doc(db, 'blocked_users', safeEmailKey)).catch(() => {}));
+      fsTasks.push(deleteDoc(doc(db, 'blocked_students', safeEmailKey)).catch(() => {}));
+      fsTasks.push(deleteDoc(doc(db, 'premium_students', safeEmailKey)).catch(() => {}));
+      fsTasks.push(setDoc(doc(db, 'deleted_students', safeEmailKey), {
+        uid: effectiveUid,
+        email: effectiveEmail,
+        name: effectiveName,
+        deletedAtMillis: Date.now()
+      }));
     }
     if (effectiveEmail) {
       fsTasks.push(deleteDoc(doc(db, 'user_accounts', effectiveEmail)).catch(() => {}));
+      fsTasks.push(deleteDoc(doc(db, 'premium_students', effectiveEmail)).catch(() => {}));
     }
 
     // 2. Clean test_results for student
@@ -1745,17 +1881,23 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     // 3. Realtime Database Cleanup
     const rtdbTasks: Promise<any>[] = [];
     try {
-      if (effectiveUid) {
-        rtdbTasks.push(rtdbSet(ref(rtdb, 'users/' + effectiveUid), null));
-        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_profiles/' + effectiveUid), null));
-        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_status/' + effectiveUid), null));
-        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_premium/' + effectiveUid), null));
-        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_sessions/' + effectiveUid), null));
-        rtdbTasks.push(rtdbSet(ref(rtdb, 'blocked_users/' + effectiveUid), null));
-        rtdbTasks.push(rtdbSet(ref(rtdb, 'deleted_students/' + effectiveUid), true));
+      if (safeUidKey) {
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'users/' + safeUidKey), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_profiles/' + safeUidKey), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_status/' + safeUidKey), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_premium/' + safeUidKey), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_sessions/' + safeUidKey), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'blocked_users/' + safeUidKey), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'deleted_students/' + safeUidKey), true));
       }
-      if (sanitizedEmailDoc) {
-        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_premium/' + sanitizedEmailDoc), null));
+      if (safeEmailKey) {
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'users/' + safeEmailKey), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_profiles/' + safeEmailKey), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_status/' + safeEmailKey), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_premium/' + safeEmailKey), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'user_sessions/' + safeEmailKey), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'blocked_users/' + safeEmailKey), null));
+        rtdbTasks.push(rtdbSet(ref(rtdb, 'deleted_students/' + safeEmailKey), true));
       }
     } catch (e) {
       console.warn('RTDB student deletion cleanup notice:', e);

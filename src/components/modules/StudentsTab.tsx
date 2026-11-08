@@ -92,7 +92,7 @@ export const StudentsTab: React.FC = () => {
       notifyWarning('Mandatory block reason is required.');
       return;
     }
-    await blockStudent(blockingStudent.uid, blockReason);
+    await blockStudent(blockingStudent.uid, blockReason, blockingStudent.email);
     notifyWarning(`Student "${blockingStudent.name || blockingStudent.email}" has been blocked.`, 'Student Blocked');
     setBlockingStudent(null);
     setBlockReason('');
@@ -662,7 +662,7 @@ export const StudentsTab: React.FC = () => {
                           isDestructive: true
                         });
                         if (confirmed) {
-                          await forceLogoutStudent(studentUid);
+                          await forceLogoutStudent(studentUid, studentEmail);
                           notifyInfo(`Force logged out ${studentName}.`, 'Session Terminated');
                         }
                       }}
@@ -698,7 +698,7 @@ export const StudentsTab: React.FC = () => {
                     <button
                       onClick={async () => {
                         if (student.isBlocked) {
-                          await unblockStudent(studentUid);
+                          await unblockStudent(studentUid, studentEmail);
                           notifySuccess(`Student "${studentName}" unblocked successfully!`, 'Student Unblocked');
                         } else {
                           setBlockingStudent(student);

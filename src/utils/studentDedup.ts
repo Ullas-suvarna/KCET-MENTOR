@@ -130,9 +130,26 @@ export function deduplicateStudentProfiles(raw: RawStudent[], deletedUids: Set<s
                              || best.createdAt
                              || '2026-10-04';
     const canonicalPhoto     = cluster.find(s => s.photoUrl)?.photoUrl || best.photoUrl || '';
-    const isPremium          = cluster.some(s => Boolean(s.isPremium));
-    const isBlocked          = cluster.some(s => Boolean(s.isBlocked));
-    const isForceLoggedOut   = cluster.some(s => Boolean(s.isForceLoggedOut));
+
+    // Determine isPremium / isBlocked / isForceLoggedOut based on newest timestamp
+    const clusterWithTime = [...cluster].sort((a, b) => 
+      (Number(b.lastUpdatedMillis || (b as any).lastUpdated) || 0) - (Number(a.lastUpdatedMillis || (a as any).lastUpdated) || 0)
+    );
+    const newestPrem = clusterWithTime.find(s => s.isPremium !== undefined || (s as any).premium !== undefined);
+    const isPremium = newestPrem !== undefined
+      ? Boolean(newestPrem.isPremium ?? (newestPrem as any).premium)
+      : cluster.some(s => Boolean(s.isPremium || (s as any).premium));
+
+    const newestBlock = clusterWithTime.find(s => s.isBlocked !== undefined || (s as any).blocked !== undefined || (s as any).status !== undefined);
+    const isBlocked = newestBlock !== undefined
+      ? Boolean(newestBlock.isBlocked ?? (newestBlock as any).blocked ?? ((newestBlock as any).status === 'BLOCKED'))
+      : cluster.some(s => Boolean(s.isBlocked || (s as any).blocked || (s as any).status === 'BLOCKED'));
+
+    const newestLogout = clusterWithTime.find(s => s.isForceLoggedOut !== undefined || (s as any).forceLogout !== undefined);
+    const isForceLoggedOut = newestLogout !== undefined
+      ? Boolean(newestLogout.isForceLoggedOut ?? (newestLogout as any).forceLogout)
+      : cluster.some(s => Boolean(s.isForceLoggedOut || (s as any).forceLogout));
+
     const blockReason        = cluster.find(s => s.blockReason)?.blockReason || best.blockReason || '';
 
     return {

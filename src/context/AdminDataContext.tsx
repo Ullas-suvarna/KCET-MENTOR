@@ -48,7 +48,8 @@ import { ConfirmModal, ConfirmDialogState } from '../components/common/ConfirmMo
 import { db, rtdb, collection, doc, setDoc, deleteDoc, updateDoc, onSnapshot, writeBatch, ref, rtdbSet, onValue, ADMIN_IDENTIFIER } from '../services/firebase';
 import { deduplicateStudentProfiles } from '../utils/studentDedup';
 
-const toSafeKey = (str: string) => (str || '').toLowerCase().trim().replace(/[.@#$[\]]/g, '_');
+const toSafeKey = (str: string) => (str || '').trim().replace(/[.@#$[\]]/g, '_');
+const toSafeEmailKey = (str: string) => (str || '').toLowerCase().trim().replace(/[.@#$[\]]/g, '_');
 interface AdminDataContextType {
   // Auth
   isAuthenticated: boolean;
@@ -1385,8 +1386,9 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         ];
         // If targeted to a specific student, write to their personal subcollection & RTDB so their app catches it instantly
         if (isTargeted && resolvedTargetUserId !== 'ALL') {
-          const targetSafeUid = toSafeKey(resolvedTargetUserId);
-          const targetSafeEmail = toSafeKey(resolvedTargetUserEmail);
+          const targetSafeUid    = toSafeKey(resolvedTargetUserId);
+          const targetSafeUidLow = targetSafeUid.toLowerCase();
+          const targetSafeEmail  = toSafeEmailKey(resolvedTargetUserEmail);
 
           if (resolvedTargetUserId) {
             notifTasks.push(setDoc(doc(db, 'users', resolvedTargetUserId, 'notifications', notifId), newNotif, { merge: true }).catch(() => {}));
@@ -1403,6 +1405,10 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             if (targetSafeUid) {
               notifTasks.push(rtdbSet(ref(rtdb, 'user_notifications/' + targetSafeUid + '/' + notifId), newNotif));
               notifTasks.push(rtdbSet(ref(rtdb, 'users/' + targetSafeUid + '/lastNotification'), newNotif));
+              if (targetSafeUidLow !== targetSafeUid) {
+                notifTasks.push(rtdbSet(ref(rtdb, 'user_notifications/' + targetSafeUidLow + '/' + notifId), newNotif));
+                notifTasks.push(rtdbSet(ref(rtdb, 'users/' + targetSafeUidLow + '/lastNotification'), newNotif));
+              }
             }
             if (targetSafeEmail) {
               notifTasks.push(rtdbSet(ref(rtdb, 'user_notifications/' + targetSafeEmail + '/' + notifId), newNotif));
@@ -1456,7 +1462,8 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const effectiveEmail = (student.email || currentStudent?.email || '').toLowerCase().trim();
     const effectiveUid   = student.uid || currentStudent?.uid || '';
     const safeUidKey     = toSafeKey(effectiveUid);
-    const safeEmailKey   = toSafeKey(effectiveEmail);
+    const safeUidLower   = safeUidKey.toLowerCase();
+    const safeEmailKey   = toSafeEmailKey(effectiveEmail);
 
     // Build comprehensive multi-platform payload covering all Android field aliases
     const payload: Record<string, unknown> = {
@@ -1550,7 +1557,7 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return prev;
     });
 
-    // ── Firestore Multi-Target Writes ──────────────────────────────
+    // ── Firestore Multi-Target Writes (SetOptions.merge: true is mandatory) ──
     const writes: Promise<any>[] = [];
     if (effectiveUid) {
       writes.push(setDoc(doc(db, 'users', effectiveUid), payload, { merge: true }));
@@ -1597,6 +1604,7 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         email: effectiveEmail,
         studentId: sid || '',
         isPremium: Boolean(student.isPremium),
+        premium: Boolean(student.isPremium),
         lastUpdatedMillis: nowMillis
       };
       if (effectiveUid) writes.push(setDoc(doc(db, 'premium_students', effectiveUid), premDoc, { merge: true }));
@@ -1606,13 +1614,17 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
     }
 
-    // ── Realtime Database (RTDB) Fast-Path Synchronization (< 50ms) ─
+    // ── Realtime Database (RTDB) Fast-Path Synchronization (< 50ms) ──
     try {
       if (safeUidKey) {
         writes.push(rtdbSet(ref(rtdb, 'users/' + safeUidKey), payload));
         writes.push(rtdbSet(ref(rtdb, 'user_profiles/' + safeUidKey), payload));
+        if (safeUidLower !== safeUidKey) {
+          writes.push(rtdbSet(ref(rtdb, 'users/' + safeUidLower), payload));
+          writes.push(rtdbSet(ref(rtdb, 'user_profiles/' + safeUidLower), payload));
+        }
       }
-      if (safeEmailKey && safeEmailKey !== safeUidKey) {
+      if (safeEmailKey) {
         writes.push(rtdbSet(ref(rtdb, 'users/' + safeEmailKey), payload));
         writes.push(rtdbSet(ref(rtdb, 'user_profiles/' + safeEmailKey), payload));
       }
@@ -1636,6 +1648,14 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           writes.push(rtdbSet(ref(rtdb, 'users/' + safeUidKey + '/isForceLoggedOut'), isLgt));
           writes.push(rtdbSet(ref(rtdb, 'blocked_users/' + safeUidKey), isBlk ? true : null));
           if (isLgt) writes.push(rtdbSet(ref(rtdb, 'user_sessions/' + safeUidKey), null));
+
+          if (safeUidLower !== safeUidKey) {
+            writes.push(rtdbSet(ref(rtdb, 'user_status/' + safeUidLower), statusObj));
+            writes.push(rtdbSet(ref(rtdb, 'users/' + safeUidLower + '/isBlocked'), isBlk));
+            writes.push(rtdbSet(ref(rtdb, 'users/' + safeUidLower + '/isForceLoggedOut'), isLgt));
+            writes.push(rtdbSet(ref(rtdb, 'blocked_users/' + safeUidLower), isBlk ? true : null));
+            if (isLgt) writes.push(rtdbSet(ref(rtdb, 'user_sessions/' + safeUidLower), null));
+          }
         }
         if (safeEmailKey) {
           writes.push(rtdbSet(ref(rtdb, 'user_status/' + safeEmailKey), statusObj));
@@ -1652,6 +1672,11 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           writes.push(rtdbSet(ref(rtdb, 'user_premium/' + safeUidKey), isPrem));
           writes.push(rtdbSet(ref(rtdb, 'users/' + safeUidKey + '/isPremium'), isPrem));
           writes.push(rtdbSet(ref(rtdb, 'user_status/' + safeUidKey + '/isPremium'), isPrem));
+          if (safeUidLower !== safeUidKey) {
+            writes.push(rtdbSet(ref(rtdb, 'user_premium/' + safeUidLower), isPrem));
+            writes.push(rtdbSet(ref(rtdb, 'users/' + safeUidLower + '/isPremium'), isPrem));
+            writes.push(rtdbSet(ref(rtdb, 'user_status/' + safeUidLower + '/isPremium'), isPrem));
+          }
         }
         if (safeEmailKey) {
           writes.push(rtdbSet(ref(rtdb, 'user_premium/' + safeEmailKey), isPrem));
@@ -1686,7 +1711,8 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const effectiveUid   = uid || target?.uid || '';
     const sid = studentId || target?.formattedStudentId || target?.studentId || '';
     const safeUidKey     = toSafeKey(effectiveUid);
-    const safeEmailKey   = toSafeKey(effectiveEmail);
+    const safeUidLower   = safeUidKey.toLowerCase();
+    const safeEmailKey   = toSafeEmailKey(effectiveEmail);
 
     // 1. Optimistic Local State Update
     setStudents(prev => prev.map(s => {
@@ -1709,16 +1735,22 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       email: effectiveEmail,
       studentId: sid,
       isPremium: Boolean(newStatus),
+      premium: Boolean(newStatus),
       lastUpdatedMillis: now
     };
 
-    // 2. Realtime Database (RTDB) Fast-Path (< 50ms)
+    // 2. Realtime Database (RTDB) The Instant Switch (< 50ms)
     const rtdbWrites: Promise<any>[] = [];
     try {
       if (safeUidKey) {
         rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + safeUidKey), Boolean(newStatus)));
         rtdbWrites.push(rtdbSet(ref(rtdb, 'users/' + safeUidKey + '/isPremium'), Boolean(newStatus)));
         rtdbWrites.push(rtdbSet(ref(rtdb, 'user_status/' + safeUidKey + '/isPremium'), Boolean(newStatus)));
+        if (safeUidLower !== safeUidKey) {
+          rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + safeUidLower), Boolean(newStatus)));
+          rtdbWrites.push(rtdbSet(ref(rtdb, 'users/' + safeUidLower + '/isPremium'), Boolean(newStatus)));
+          rtdbWrites.push(rtdbSet(ref(rtdb, 'user_status/' + safeUidLower + '/isPremium'), Boolean(newStatus)));
+        }
       }
       if (safeEmailKey) {
         rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + safeEmailKey), Boolean(newStatus)));
@@ -1729,7 +1761,7 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       console.warn('RTDB user_premium update notice:', rtdbErr);
     }
 
-    // 3. Cloud Firestore Persistent Storage (SetOptions.merge: true)
+    // 3. Cloud Firestore Persistent Storage (SetOptions.merge: true is mandatory)
     const fsWrites: Promise<any>[] = [];
     if (effectiveUid) {
       fsWrites.push(setDoc(doc(db, 'users', effectiveUid), updatePayload, { merge: true }));
@@ -1808,9 +1840,11 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     for (const s of students) {
       try {
         await updateDoc(doc(db, 'users', s.uid), { isForceLoggedOut: true });
-        const safeK = toSafeKey(s.uid);
-        const safeEm = toSafeKey(s.email);
+        const safeK   = toSafeKey(s.uid);
+        const safeKL  = safeK.toLowerCase();
+        const safeEm  = toSafeEmailKey(s.email);
         if (safeK) await rtdbSet(ref(rtdb, 'user_status/' + safeK + '/isForceLoggedOut'), true);
+        if (safeKL && safeKL !== safeK) await rtdbSet(ref(rtdb, 'user_status/' + safeKL + '/isForceLoggedOut'), true);
         if (safeEm) await rtdbSet(ref(rtdb, 'user_status/' + safeEm + '/isForceLoggedOut'), true);
       } catch (e) {}
     }
@@ -1825,7 +1859,8 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const effectiveEmail = (email || student?.email || '').toLowerCase().trim();
     const effectiveUid   = uid || student?.uid || '';
     const safeUidKey     = toSafeKey(effectiveUid);
-    const safeEmailKey   = toSafeKey(effectiveEmail);
+    const safeUidLower   = safeUidKey.toLowerCase();
+    const safeEmailKey   = toSafeEmailKey(effectiveEmail);
 
     setStudents(prev => prev.filter(s => s.uid !== effectiveUid && (effectiveEmail ? s.email?.toLowerCase() !== effectiveEmail : true)));
     const deletedEntry: DeletedStudent = {
@@ -1878,7 +1913,7 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       fsTasks.push(deleteDoc(doc(db, 'test_results', res.id)).catch(() => {}));
     }
 
-    // 3. Realtime Database Cleanup
+    // 3. Realtime Database Cleanup (both exact case and lowercased)
     const rtdbTasks: Promise<any>[] = [];
     try {
       if (safeUidKey) {
@@ -1889,6 +1924,16 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         rtdbTasks.push(rtdbSet(ref(rtdb, 'user_sessions/' + safeUidKey), null));
         rtdbTasks.push(rtdbSet(ref(rtdb, 'blocked_users/' + safeUidKey), null));
         rtdbTasks.push(rtdbSet(ref(rtdb, 'deleted_students/' + safeUidKey), true));
+
+        if (safeUidLower !== safeUidKey) {
+          rtdbTasks.push(rtdbSet(ref(rtdb, 'users/' + safeUidLower), null));
+          rtdbTasks.push(rtdbSet(ref(rtdb, 'user_profiles/' + safeUidLower), null));
+          rtdbTasks.push(rtdbSet(ref(rtdb, 'user_status/' + safeUidLower), null));
+          rtdbTasks.push(rtdbSet(ref(rtdb, 'user_premium/' + safeUidLower), null));
+          rtdbTasks.push(rtdbSet(ref(rtdb, 'user_sessions/' + safeUidLower), null));
+          rtdbTasks.push(rtdbSet(ref(rtdb, 'blocked_users/' + safeUidLower), null));
+          rtdbTasks.push(rtdbSet(ref(rtdb, 'deleted_students/' + safeUidLower), true));
+        }
       }
       if (safeEmailKey) {
         rtdbTasks.push(rtdbSet(ref(rtdb, 'users/' + safeEmailKey), null));

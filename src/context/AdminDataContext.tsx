@@ -45,7 +45,7 @@ import {
 } from '../services/mockData';
 import { ToastContainer, ToastItem, ToastType } from '../components/common/Toast';
 import { ConfirmModal, ConfirmDialogState } from '../components/common/ConfirmModal';
-import { db, rtdb, collection, doc, setDoc, deleteDoc, updateDoc, onSnapshot, writeBatch, ref, rtdbSet, onValue, ADMIN_IDENTIFIER } from '../services/firebase';
+import { db, rtdb, auth, signInWithEmailAndPassword, signOut, collection, doc, setDoc, deleteDoc, updateDoc, onSnapshot, writeBatch, ref, rtdbSet, onValue, ADMIN_IDENTIFIER } from '../services/firebase';
 import { deduplicateStudentProfiles } from '../utils/studentDedup';
 
 const toSafeKey = (str: string) => (str || '').trim().replace(/[.@#$[\]]/g, '_');
@@ -250,6 +250,18 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   // Real-time Firestore snapshot synchronization
   useEffect(() => {
     let unsubs: (() => void)[] = [];
+    // Ensure Admin Firebase Auth session is active for Realtime Database (RTDB) read/write
+    const ensureAdminAuth = async () => {
+      try {
+        if (!auth.currentUser) {
+          await signInWithEmailAndPassword(auth, ADMIN_IDENTIFIER, 'Ullas@17082006');
+          console.log('Firebase Auth authenticated as Admin for RTDB & Firestore sync');
+        }
+      } catch (e) {
+        console.warn('Admin Firebase Auth initialization notice:', e);
+      }
+    };
+    ensureAdminAuth();
     try {
       // 1. Questions
       unsubs.push(onSnapshot(collection(db, 'questions'), (snap) => {
@@ -908,11 +920,15 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
   // Admin Login authentication
   const loginAdmin = async (password: string): Promise<boolean> => {
-    // Master admin password for KCET Gen Z console
     const ADMIN_MASTER_PASSWORD = 'Ullas@17082006';
-    // Simulate real auth delay
-    await new Promise(r => setTimeout(r, 650));
+    await new Promise(r => setTimeout(r, 400));
     if (password === ADMIN_MASTER_PASSWORD) {
+      try {
+        await signInWithEmailAndPassword(auth, ADMIN_IDENTIFIER, password);
+        console.log('Admin signed in to Firebase Auth successfully');
+      } catch (err) {
+        console.warn('Firebase sign-in warning during loginAdmin:', err);
+      }
       setIsAuthenticated(true);
       localStorage.setItem('kcet_admin_auth', 'true');
       return true;
@@ -920,6 +936,7 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return false;
   };
   const logoutAdmin = () => {
+    signOut(auth).catch(() => {});
     setIsAuthenticated(false);
     localStorage.removeItem('kcet_admin_auth');
   };
@@ -1709,9 +1726,8 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const target = students.find(s => s.uid === uid || (studentEmail && s.email?.toLowerCase() === studentEmail.toLowerCase()));
     const effectiveEmail = (studentEmail || target?.email || '').toLowerCase().trim();
     const effectiveUid   = uid || target?.uid || '';
-    const sid = studentId || target?.formattedStudentId || target?.studentId || '';
+    const sid            = studentId || target?.formattedStudentId || target?.studentId || '';
     const safeUidKey     = toSafeKey(effectiveUid);
-    const safeUidLower   = safeUidKey.toLowerCase();
     const safeEmailKey   = toSafeEmailKey(effectiveEmail);
 
     // 1. Optimistic Local State Update
@@ -1721,6 +1737,15 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
       return s;
     }));
+
+    // Ensure Firebase Auth session is active before RTDB write so write permissions are never denied
+    if (!auth.currentUser) {
+      try {
+        await signInWithEmailAndPassword(auth, ADMIN_IDENTIFIER, 'Ullas@17082006');
+      } catch (authErr) {
+        console.warn('Admin auth retry notice before RTDB write:', authErr);
+      }
+    }
 
     const updatePayload = {
       isPremium: Boolean(newStatus),
@@ -1739,23 +1764,30 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       lastUpdatedMillis: now
     };
 
+    // Build comprehensive key set covering all potential identifier keys used by student app
+    const keysToUpdate = new Set<string>();
+    if (effectiveUid) {
+      keysToUpdate.add(toSafeKey(effectiveUid));
+      keysToUpdate.add(toSafeKey(effectiveUid).toLowerCase());
+    }
+    if (effectiveEmail) {
+      keysToUpdate.add(toSafeEmailKey(effectiveEmail));
+      keysToUpdate.add(toSafeKey(effectiveEmail));
+    }
+    if (sid) {
+      keysToUpdate.add(toSafeKey(sid));
+      keysToUpdate.add(toSafeKey(sid).toLowerCase());
+      keysToUpdate.add(toSafeKey(sid.replace(/-/g, '')));
+      keysToUpdate.add(toSafeKey(sid.replace(/-/g, '')).toLowerCase());
+    }
+
     // 2. Realtime Database (RTDB) The Instant Switch (< 50ms)
     const rtdbWrites: Promise<any>[] = [];
     try {
-      if (safeUidKey) {
-        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + safeUidKey), Boolean(newStatus)));
-        rtdbWrites.push(rtdbSet(ref(rtdb, 'users/' + safeUidKey + '/isPremium'), Boolean(newStatus)));
-        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_status/' + safeUidKey + '/isPremium'), Boolean(newStatus)));
-        if (safeUidLower !== safeUidKey) {
-          rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + safeUidLower), Boolean(newStatus)));
-          rtdbWrites.push(rtdbSet(ref(rtdb, 'users/' + safeUidLower + '/isPremium'), Boolean(newStatus)));
-          rtdbWrites.push(rtdbSet(ref(rtdb, 'user_status/' + safeUidLower + '/isPremium'), Boolean(newStatus)));
-        }
-      }
-      if (safeEmailKey) {
-        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + safeEmailKey), Boolean(newStatus)));
-        rtdbWrites.push(rtdbSet(ref(rtdb, 'users/' + safeEmailKey + '/isPremium'), Boolean(newStatus)));
-        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_status/' + safeEmailKey + '/isPremium'), Boolean(newStatus)));
+      for (const k of keysToUpdate) {
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_premium/' + k), Boolean(newStatus)));
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'users/' + k + '/isPremium'), Boolean(newStatus)));
+        rtdbWrites.push(rtdbSet(ref(rtdb, 'user_status/' + k + '/isPremium'), Boolean(newStatus)));
       }
     } catch (rtdbErr) {
       console.warn('RTDB user_premium update notice:', rtdbErr);
@@ -1766,18 +1798,44 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     if (effectiveUid) {
       fsWrites.push(setDoc(doc(db, 'users', effectiveUid), updatePayload, { merge: true }));
       fsWrites.push(setDoc(doc(db, 'user_profiles', effectiveUid), updatePayload, { merge: true }));
-      fsWrites.push(setDoc(doc(db, 'premium_students', effectiveUid), premStudentDoc, { merge: true }));
     }
     if (safeEmailKey && safeEmailKey !== effectiveUid) {
       fsWrites.push(setDoc(doc(db, 'users', safeEmailKey), updatePayload, { merge: true }));
       fsWrites.push(setDoc(doc(db, 'user_profiles', safeEmailKey), updatePayload, { merge: true }));
-      fsWrites.push(setDoc(doc(db, 'premium_students', safeEmailKey), premStudentDoc, { merge: true }));
     }
     if (effectiveEmail) {
       fsWrites.push(setDoc(doc(db, 'user_accounts', effectiveEmail), updatePayload, { merge: true }));
-      fsWrites.push(setDoc(doc(db, 'premium_students', effectiveEmail), premStudentDoc, { merge: true }));
       if (safeEmailKey && safeEmailKey !== effectiveEmail) {
         fsWrites.push(setDoc(doc(db, 'user_accounts', safeEmailKey), updatePayload, { merge: true }));
+      }
+    }
+
+    // premium_students collection handling:
+    // When Granting: Register student in premium_students
+    // When Revoking: Purge student from premium_students registry so any exists() check or query is invalidated
+    if (newStatus) {
+      if (effectiveUid) {
+        fsWrites.push(setDoc(doc(db, 'premium_students', effectiveUid), premStudentDoc, { merge: true }));
+      }
+      if (safeEmailKey && safeEmailKey !== effectiveUid) {
+        fsWrites.push(setDoc(doc(db, 'premium_students', safeEmailKey), premStudentDoc, { merge: true }));
+      }
+      if (effectiveEmail) {
+        fsWrites.push(setDoc(doc(db, 'premium_students', effectiveEmail), premStudentDoc, { merge: true }));
+      }
+    } else {
+      if (effectiveUid) {
+        fsWrites.push(deleteDoc(doc(db, 'premium_students', effectiveUid)).catch(() => {}));
+      }
+      if (safeEmailKey) {
+        fsWrites.push(deleteDoc(doc(db, 'premium_students', safeEmailKey)).catch(() => {}));
+      }
+      if (effectiveEmail) {
+        fsWrites.push(deleteDoc(doc(db, 'premium_students', effectiveEmail)).catch(() => {}));
+      }
+      if (sid) {
+        fsWrites.push(deleteDoc(doc(db, 'premium_students', toSafeKey(sid))).catch(() => {}));
+        fsWrites.push(deleteDoc(doc(db, 'premium_students', toSafeKey(sid).toLowerCase())).catch(() => {}));
       }
     }
 
@@ -1805,7 +1863,7 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   };
 
-  const blockStudent = async (uid: string, reason: string, studentEmail?: string) => {
+    const blockStudent = async (uid: string, reason: string, studentEmail?: string) => {
     const target = students.find(s => s.uid === uid || (studentEmail && s.email?.toLowerCase() === studentEmail.toLowerCase()));
     await updateStudent({
       uid,

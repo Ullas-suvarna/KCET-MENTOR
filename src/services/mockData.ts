@@ -3034,11 +3034,11 @@ export const INITIAL_BRANCHES: EngineeringBranch[] = [
 // ⚔️ 1 VS 1 CHALLENGES MOCK / INITIAL DATA
 // ==========================================
 export const INITIAL_QUESTION_SETS: ChallengeQuestionSet[] = [
-  { id: 'set-01', name: 'KCET PCM Challenge Set 01', questionCount: 20, subjects: 'Physics • Chemistry • Math PCM', isActive: true },
-  { id: 'set-02', name: 'KCET PCM Challenge Set 02', questionCount: 20, subjects: 'Physics • Chemistry • Math PCM', isActive: true },
-  { id: 'set-03', name: 'KCET PCM Challenge Set 03', questionCount: 20, subjects: 'Physics • Chemistry • Math PCM', isActive: true },
-  { id: 'set-04', name: 'KCET PCM Challenge Set 04', questionCount: 20, subjects: 'Physics • Chemistry • Math PCM', isActive: true },
-  { id: 'set-05', name: 'KCET PCM Challenge Set 05', questionCount: 20, subjects: 'Physics • Chemistry • Math PCM', isActive: true }
+  { id: 'set_01', setId: 'set_01', name: 'KCET PCM Challenge Set 01', description: 'Balanced Physics, Chemistry, and Math 20-Q Challenge', questionCount: 20, subjects: 'Physics • Chemistry • Math PCM', isActive: true },
+  { id: 'set_02', setId: 'set_02', name: 'KCET PCM Challenge Set 02', description: 'Balanced Physics, Chemistry, and Math 20-Q Challenge', questionCount: 20, subjects: 'Physics • Chemistry • Math PCM', isActive: true },
+  { id: 'set_03', setId: 'set_03', name: 'KCET PCM Challenge Set 03', description: 'Balanced Physics, Chemistry, and Math 20-Q Challenge', questionCount: 20, subjects: 'Physics • Chemistry • Math PCM', isActive: true },
+  { id: 'set_04', setId: 'set_04', name: 'KCET PCM Challenge Set 04', description: 'Balanced Physics, Chemistry, and Math 20-Q Challenge', questionCount: 20, subjects: 'Physics • Chemistry • Math PCM', isActive: true },
+  { id: 'set_05', setId: 'set_05', name: 'KCET PCM Challenge Set 05', description: 'Balanced Physics, Chemistry, and Math 20-Q Challenge', questionCount: 20, subjects: 'Physics • Chemistry • Math PCM', isActive: true }
 ];
 
 export const INITIAL_CHALLENGE_SETTINGS: ChallengeSettings = {

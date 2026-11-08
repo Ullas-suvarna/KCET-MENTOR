@@ -620,39 +620,54 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }, () => {});
         unsubs.push(() => unsubTimer());
 
-        unsubs.push(onSnapshot(collection(db, 'challenge_question_sets'), (snap) => {
+        // Listen to exact Firestore collection: 'challengeQuestionSets'
+        unsubs.push(onSnapshot(collection(db, 'challengeQuestionSets'), (snap) => {
           if (!snap.empty) {
             const remoteMap = new Map<string, any>();
-            snap.forEach(d => remoteMap.set(d.id, d.data()));
+            snap.forEach(d => {
+              const data = d.data();
+              const key = d.id;
+              remoteMap.set(key, { ...data, setId: data.setId || key });
+              // Also map hyphenated alias
+              remoteMap.set(key.replace('_', '-'), { ...data, setId: data.setId || key });
+            });
 
-            // Merge with INITIAL_QUESTION_SETS so default 5 sets always have complete metadata
             const merged: ChallengeQuestionSet[] = INITIAL_QUESTION_SETS.map((init, idx) => {
-              const remote = remoteMap.get(init.id);
+              const remote = remoteMap.get(init.id) || remoteMap.get(init.id.replace('_', '-')) || remoteMap.get(init.id.replace('-', '_'));
               if (!remote) return init;
+              const qCount = Array.isArray(remote.questions) ? remote.questions.length : (remote.questionCount ?? init.questionCount);
               return {
                 ...init,
                 ...remote,
+                id: remote.setId || init.id,
+                setId: remote.setId || init.id,
                 name: remote.name || init.name || ('KCET PCM Challenge Set ' + String(idx + 1).padStart(2, '0')),
-                questionCount: remote.questionCount !== undefined ? Number(remote.questionCount) : init.questionCount,
+                description: remote.description || init.description,
+                questionCount: qCount,
                 subjects: remote.subjects || init.subjects,
-                isActive: remote.isActive !== undefined ? Boolean(remote.isActive) : init.isActive
+                isActive: remote.isActive !== undefined ? Boolean(remote.isActive) : init.isActive,
+                questions: remote.questions || []
               };
             });
 
-            // Add any custom sets created dynamically
+            // Add any extra custom sets
             remoteMap.forEach((data, id) => {
-              if (!INITIAL_QUESTION_SETS.some(s => s.id === id)) {
+              if (!id.includes('-') && !INITIAL_QUESTION_SETS.some(s => s.id === id || s.id === id.replace('_', '-'))) {
                 merged.push({
                   id,
+                  setId: data.setId || id,
                   name: data.name || ('KCET PCM Challenge Set ' + id),
-                  questionCount: data.questionCount !== undefined ? Number(data.questionCount) : 20,
+                  description: data.description || 'Balanced Physics, Chemistry, and Math 20-Q Challenge',
+                  questionCount: Array.isArray(data.questions) ? data.questions.length : 20,
                   subjects: data.subjects || 'Physics • Chemistry • Math PCM',
                   isActive: data.isActive !== undefined ? Boolean(data.isActive) : true,
+                  questions: data.questions || [],
                   ...data
                 });
               }
             });
 
+            merged.sort((a, b) => a.id.localeCompare(b.id));
             setQuestionSets(merged);
           } else {
             setQuestionSets(INITIAL_QUESTION_SETS);
@@ -1945,26 +1960,20 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   };
 
   const toggleQuestionSet = async (id: string, active: boolean) => {
-    setQuestionSets(prev => prev.map(s => s.id === id ? { ...s, isActive: active } : s));
+    setQuestionSets(prev => prev.map(s => (s.id === id || s.setId === id) ? { ...s, isActive: active } : s));
 
-    const setItem = questionSets.find(s => s.id === id) || INITIAL_QUESTION_SETS.find(s => s.id === id);
-    const payload = {
-      id,
-      name: setItem?.name || ('KCET PCM Challenge Set ' + id.replace('set-', '')),
-      questionCount: setItem?.questionCount || 20,
-      subjects: setItem?.subjects || 'Physics • Chemistry • Math PCM',
-      isActive: active
-    };
+    const setItem = questionSets.find(s => s.id === id || s.setId === id) || INITIAL_QUESTION_SETS.find(s => s.id === id);
+    const setId = setItem?.setId || id;
 
+    // Direct Firestore merge write to challengeQuestionSets
     const tasks: Promise<any>[] = [
-      setDoc(doc(db, 'challenge_question_sets', id), payload, { merge: true })
+      setDoc(doc(db, 'challengeQuestionSets', setId), { isActive: active }, { merge: true }),
+      setDoc(doc(db, 'challengeQuestionSets', setId.replace('-', '_')), { isActive: active }, { merge: true }),
+      setDoc(doc(db, 'challenge_question_sets', setId), { isActive: active }, { merge: true })
     ];
-    try {
-      tasks.push(rtdbSet(ref(rtdb, 'challenge_question_sets/' + id), payload));
-    } catch (e) {}
 
     await Promise.all(tasks).catch(e => console.warn('Toggle question set error:', e));
-    notifySuccess('Question set ' + (active ? 'activated' : 'deactivated') + ' and synced with App.', 'Set Updated');
+    notifySuccess('Question Set ' + setId + ' is now ' + (active ? 'ACTIVE' : 'DISABLED') + ' and synced with App.', 'Set Updated');
   };
 
   const updateChallengeSettings = async (settings: Partial<ChallengeSettings>) => {

@@ -1093,10 +1093,14 @@ export interface OneVsOneChallenge {
 
 export interface ChallengeQuestionSet {
   id: string;
+  setId?: string;
   name: string;
+  description?: string;
   questionCount: number;
   subjects: string;
   isActive: boolean;
+  createdAt?: number;
+  questions?: any[];
 }
 
 export interface ChallengeSettings {

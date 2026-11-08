@@ -620,58 +620,54 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }, () => {});
         unsubs.push(() => unsubTimer());
 
-        // Listen to exact Firestore collection: 'challengeQuestionSets'
+        // Dual real-time listener for question sets (challenge_question_sets + challengeQuestionSets)
+        const setsA = new Map<string, any>();
+        const setsB = new Map<string, any>();
+
+        const syncQuestionSets = () => {
+          const remoteMap = new Map<string, any>();
+          setsB.forEach((val, key) => remoteMap.set(key, val));
+          setsA.forEach((val, key) => remoteMap.set(key, val));
+
+          const merged: ChallengeQuestionSet[] = INITIAL_QUESTION_SETS.map((init, idx) => {
+            const underscoreKey = 'set_' + String(idx + 1).padStart(2, '0');
+            const hyphenKey = 'set-' + String(idx + 1).padStart(2, '0');
+            const remote = remoteMap.get(init.id) 
+              || remoteMap.get(underscoreKey) 
+              || remoteMap.get(hyphenKey);
+
+            if (!remote) return init;
+            const qCount = Array.isArray(remote.questions) ? remote.questions.length : (remote.questionCount ?? init.questionCount);
+            return {
+              ...init,
+              ...remote,
+              id: remote.setId || init.id,
+              setId: remote.setId || init.id,
+              name: remote.name || init.name || ('KCET PCM Challenge Set ' + String(idx + 1).padStart(2, '0')),
+              description: remote.description || init.description,
+              questionCount: qCount,
+              subjects: remote.subjects || init.subjects,
+              isActive: remote.isActive !== undefined ? Boolean(remote.isActive) : init.isActive,
+              questions: remote.questions || []
+            };
+          });
+
+          merged.sort((a, b) => a.id.localeCompare(b.id));
+          setQuestionSets(merged);
+        };
+
+        // Listen to Android primary collection: challenge_question_sets
+        unsubs.push(onSnapshot(collection(db, 'challenge_question_sets'), (snap) => {
+          setsA.clear();
+          snap.forEach(d => setsA.set(d.id, d.data()));
+          syncQuestionSets();
+        }, () => {}));
+
+        // Listen also to challengeQuestionSets
         unsubs.push(onSnapshot(collection(db, 'challengeQuestionSets'), (snap) => {
-          if (!snap.empty) {
-            const remoteMap = new Map<string, any>();
-            snap.forEach(d => {
-              const data = d.data();
-              const key = d.id;
-              remoteMap.set(key, { ...data, setId: data.setId || key });
-              // Also map hyphenated alias
-              remoteMap.set(key.replace('_', '-'), { ...data, setId: data.setId || key });
-            });
-
-            const merged: ChallengeQuestionSet[] = INITIAL_QUESTION_SETS.map((init, idx) => {
-              const remote = remoteMap.get(init.id) || remoteMap.get(init.id.replace('_', '-')) || remoteMap.get(init.id.replace('-', '_'));
-              if (!remote) return init;
-              const qCount = Array.isArray(remote.questions) ? remote.questions.length : (remote.questionCount ?? init.questionCount);
-              return {
-                ...init,
-                ...remote,
-                id: remote.setId || init.id,
-                setId: remote.setId || init.id,
-                name: remote.name || init.name || ('KCET PCM Challenge Set ' + String(idx + 1).padStart(2, '0')),
-                description: remote.description || init.description,
-                questionCount: qCount,
-                subjects: remote.subjects || init.subjects,
-                isActive: remote.isActive !== undefined ? Boolean(remote.isActive) : init.isActive,
-                questions: remote.questions || []
-              };
-            });
-
-            // Add any extra custom sets
-            remoteMap.forEach((data, id) => {
-              if (!id.includes('-') && !INITIAL_QUESTION_SETS.some(s => s.id === id || s.id === id.replace('_', '-'))) {
-                merged.push({
-                  id,
-                  setId: data.setId || id,
-                  name: data.name || ('KCET PCM Challenge Set ' + id),
-                  description: data.description || 'Balanced Physics, Chemistry, and Math 20-Q Challenge',
-                  questionCount: Array.isArray(data.questions) ? data.questions.length : 20,
-                  subjects: data.subjects || 'Physics • Chemistry • Math PCM',
-                  isActive: data.isActive !== undefined ? Boolean(data.isActive) : true,
-                  questions: data.questions || [],
-                  ...data
-                });
-              }
-            });
-
-            merged.sort((a, b) => a.id.localeCompare(b.id));
-            setQuestionSets(merged);
-          } else {
-            setQuestionSets(INITIAL_QUESTION_SETS);
-          }
+          setsB.clear();
+          snap.forEach(d => setsB.set(d.id, d.data()));
+          syncQuestionSets();
         }, () => {}));
       } catch (e) {
         console.warn('Challenge listeners notice:', e);
@@ -1960,20 +1956,26 @@ export const AdminDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   };
 
   const toggleQuestionSet = async (id: string, active: boolean) => {
-    setQuestionSets(prev => prev.map(s => (s.id === id || s.setId === id) ? { ...s, isActive: active } : s));
+    const idWithUnderscore = id.replace('-', '_');
+    const idWithHyphen = id.replace('_', '-');
 
-    const setItem = questionSets.find(s => s.id === id || s.setId === id) || INITIAL_QUESTION_SETS.find(s => s.id === id);
-    const setId = setItem?.setId || id;
+    setQuestionSets(prev => prev.map(s => 
+      (s.id === id || s.id === idWithUnderscore || s.id === idWithHyphen || s.setId === idWithUnderscore || s.setId === idWithHyphen) 
+        ? { ...s, isActive: active } 
+        : s
+    ));
 
-    // Direct Firestore merge write to challengeQuestionSets
+    // Direct Firestore merge write to BOTH collections with BOTH ID formats (underscore & hyphen)
+    // Ensures whether Android listens to 'challenge_question_sets' or 'challengeQuestionSets', it receives the update!
     const tasks: Promise<any>[] = [
-      setDoc(doc(db, 'challengeQuestionSets', setId), { isActive: active }, { merge: true }),
-      setDoc(doc(db, 'challengeQuestionSets', setId.replace('-', '_')), { isActive: active }, { merge: true }),
-      setDoc(doc(db, 'challenge_question_sets', setId), { isActive: active }, { merge: true })
+      setDoc(doc(db, 'challenge_question_sets', idWithUnderscore), { isActive: active }, { merge: true }),
+      setDoc(doc(db, 'challenge_question_sets', idWithHyphen), { isActive: active }, { merge: true }),
+      setDoc(doc(db, 'challengeQuestionSets', idWithUnderscore), { isActive: active }, { merge: true }),
+      setDoc(doc(db, 'challengeQuestionSets', idWithHyphen), { isActive: active }, { merge: true })
     ];
 
     await Promise.all(tasks).catch(e => console.warn('Toggle question set error:', e));
-    notifySuccess('Question Set ' + setId + ' is now ' + (active ? 'ACTIVE' : 'DISABLED') + ' and synced with App.', 'Set Updated');
+    notifySuccess('Question Set ' + idWithUnderscore + ' is now ' + (active ? 'ACTIVE' : 'DISABLED') + ' and synced with App.', 'Set Updated');
   };
 
   const updateChallengeSettings = async (settings: Partial<ChallengeSettings>) => {
